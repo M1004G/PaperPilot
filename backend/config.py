@@ -1,8 +1,20 @@
 """Central configuration for the whole backend."""
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ---------- Storage ----------
+DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
+DATA_DIR.mkdir(exist_ok=True)
+DB_PATH = DATA_DIR / "sessions.db"
+
+# ---------- Upload validation ----------
+MAX_PDF_SIZE_MB = int(os.getenv("MAX_PDF_SIZE_MB", "25"))
+
+# ---------- Logging ----------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 # ---------- LLM provider (Groq) ----------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
@@ -25,6 +37,10 @@ TOP_K = 5
 RERANK_ENABLED = os.getenv("RERANK_ENABLED", "true").lower() == "true"
 RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 RERANK_CANDIDATE_POOL = 20
+
+# Chat history sent to the LLM is capped by character budget (not just turn count),
+# since a handful of long turns can still blow past a reasonable prompt size.
+MAX_HISTORY_CHARS = int(os.getenv("MAX_HISTORY_CHARS", "6000"))
 
 # LLM call defaults
 # Groq's free-tier TPM cap (as low as 6000 tokens/min on some models) is the real

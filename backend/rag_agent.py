@@ -48,28 +48,42 @@ def _split_sentences(text: str) -> list[str]:
     return [s.strip() for s in sentences if s.strip()]
 
 
+def _sentences_with_pages(section: Section) -> list[tuple[int, str]]:
+    """Split each page-segment of a section into sentences, tagging each sentence
+    with the actual page it came from."""
+    tagged: list[tuple[int, str]] = []
+    segments = section.page_segments or [(section.page_start, section.text)]
+    for page_num, seg_text in segments:
+        for sentence in _split_sentences(seg_text):
+            tagged.append((page_num, sentence))
+    return tagged
+
+
 def chunk_section(section: Section, chunk_size: int = None, overlap: int = None) -> list[dict]:
-    """Pack a section's sentences into ~chunk_size chunks without splitting mid-sentence."""
+    """Pack a section's sentences into ~chunk_size chunks without splitting mid-sentence.
+    Each chunk's page_start/page_end reflects only the pages its own sentences came from
+    (usually one page; two only if the chunk happens to straddle a page break)."""
     chunk_size = chunk_size or config.CHUNK_SIZE
     overlap = overlap or config.CHUNK_OVERLAP
-    sentences = _split_sentences(section.text)
-    if not sentences:
+    tagged_sentences = _sentences_with_pages(section)
+    if not tagged_sentences:
         return []
 
     chunks: list[dict] = []
-    current: list[str] = []
+    current: list[tuple[int, str]] = []
     current_len = 0
 
     def _flush():
         if current:
+            pages = [p for p, _ in current]
             chunks.append({
-                "text": " ".join(current).strip(),
+                "text": " ".join(s for _, s in current).strip(),
                 "heading": section.heading,
-                "page_start": section.page_start,
-                "page_end": section.page_end,
+                "page_start": min(pages),
+                "page_end": max(pages),
             })
 
-    for sentence in sentences:
+    for page_num, sentence in tagged_sentences:
         # A single sentence longer than chunk_size is kept whole rather than cut mid-word;
         # over-long chunks are rare and better than corrupting a sentence.
         if current_len + len(sentence) + 1 > chunk_size and current:
@@ -77,15 +91,15 @@ def chunk_section(section: Section, chunk_size: int = None, overlap: int = None)
             # Carry the tail of the previous chunk forward for overlap/context continuity.
             overlap_sentences = []
             overlap_len = 0
-            for s in reversed(current):
+            for p, s in reversed(current):
                 if overlap_len + len(s) > overlap:
                     break
-                overlap_sentences.insert(0, s)
+                overlap_sentences.insert(0, (p, s))
                 overlap_len += len(s)
             current = overlap_sentences
             current_len = overlap_len
 
-        current.append(sentence)
+        current.append((page_num, sentence))
         current_len += len(sentence) + 1
 
     _flush()
@@ -177,14 +191,27 @@ def _format_chunk(r: dict) -> str:
     return f"[{r['heading']}, {page_label}]\n{r['text']}"
 
 
+def _bounded_history(history: list[dict]) -> list[dict]:
+    """Keep the most recent turns up to a character budget (proxy for token budget),
+    rather than a fixed turn count -- a handful of long turns can still blow past a
+    reasonable prompt size even under the old history[-6:] cap."""
+    kept: list[dict] = []
+    used = 0
+    for turn in reversed(history):
+        length = len(turn.get("content", ""))
+        if kept and used + length > config.MAX_HISTORY_CHARS:
+            break
+        kept.insert(0, turn)
+        used += length
+    return kept
+
+
 def answer(index: RAGIndex, query: str, history: list[dict] = None, k: int = None) -> dict:
     history = history or []
     retrieved = index.retrieve(query, k=k)
     context_block = "\n\n".join(_format_chunk(r) for r in retrieved)
 
-    convo = []
-    for turn in history[-6:]:  # keep last few turns for context
-        convo.append({"role": turn["role"], "content": turn["content"]})
+    convo = [{"role": t["role"], "content": t["content"]} for t in _bounded_history(history)]
 
     user_message = f"""Context from the paper:
 {context_block}

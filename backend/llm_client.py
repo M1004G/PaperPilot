@@ -2,8 +2,10 @@
 
 Groq's free tier is rate-limited (requests/min, tokens/min, requests/day) rather
 than credit-metered, so 429s are an expected part of normal operation here --
-not just an edge case. Every call goes through retry-with-backoff.
+not just an edge case. Every call goes through retry-with-backoff, and every
+call is logged with timing + token usage for basic observability.
 """
+import logging
 import random
 import time
 
@@ -11,6 +13,15 @@ import groq
 from groq import Groq
 
 from backend import config
+
+logger = logging.getLogger("paperpilot.llm")
+
+
+class LLMProviderError(RuntimeError):
+    """Raised when the LLM provider call fails after all retries are exhausted.
+    The FastAPI layer maps this to a 502 (upstream failure), distinct from bugs
+    in our own code (500) or bad input from the user (400)."""
+
 
 _client = None
 
@@ -31,14 +42,25 @@ def _call_with_retry(**create_kwargs) -> str:
     """Call the Groq chat completion endpoint, retrying on rate limits / transient errors."""
     client = _get_client()
     last_error = None
+    call_start = time.monotonic()
 
     for attempt in range(config.LLM_MAX_RETRIES):
         try:
+            attempt_start = time.monotonic()
             resp = client.chat.completions.create(**create_kwargs)
+            elapsed = time.monotonic() - attempt_start
+            usage = resp.usage
+            logger.info(
+                "groq_call_ok model=%s attempt=%d elapsed=%.2fs prompt_tokens=%s "
+                "completion_tokens=%s total_tokens=%s",
+                create_kwargs.get("model"), attempt + 1, elapsed,
+                getattr(usage, "prompt_tokens", "?"),
+                getattr(usage, "completion_tokens", "?"),
+                getattr(usage, "total_tokens", "?"),
+            )
             return resp.choices[0].message.content or ""
         except groq.RateLimitError as e:
             last_error = e
-            # Respect a server-provided retry-after if present, else exponential backoff + jitter.
             retry_after = None
             try:
                 retry_after = float(e.response.headers.get("retry-after", ""))
@@ -46,13 +68,25 @@ def _call_with_retry(**create_kwargs) -> str:
                 pass
             delay = retry_after if retry_after else config.LLM_BACKOFF_BASE_SECONDS * (2 ** attempt)
             delay += random.uniform(0, 0.5)
+            logger.warning(
+                "groq_rate_limited attempt=%d retrying_in=%.2fs", attempt + 1, delay
+            )
             time.sleep(delay)
         except (groq.APIConnectionError, groq.APITimeoutError, groq.InternalServerError) as e:
             last_error = e
             delay = config.LLM_BACKOFF_BASE_SECONDS * (2 ** attempt) + random.uniform(0, 0.5)
+            logger.warning(
+                "groq_transient_error attempt=%d error=%s retrying_in=%.2fs",
+                attempt + 1, type(e).__name__, delay
+            )
             time.sleep(delay)
 
-    raise RuntimeError(
+    total_elapsed = time.monotonic() - call_start
+    logger.error(
+        "groq_call_failed after %d retries in %.2fs: %s",
+        config.LLM_MAX_RETRIES, total_elapsed, last_error,
+    )
+    raise LLMProviderError(
         f"Groq API call failed after {config.LLM_MAX_RETRIES} retries: {last_error}"
     ) from last_error
 
