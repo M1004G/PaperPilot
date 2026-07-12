@@ -25,6 +25,7 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "5"))
 LLM_BACKOFF_BASE_SECONDS = float(os.getenv("LLM_BACKOFF_BASE_SECONDS", "1.0"))
 LLM_MAX_CONCURRENT_CALLS = int(os.getenv("LLM_MAX_CONCURRENT_CALLS", "3"))
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
 
 # RAG tuning
 CHUNK_SIZE = 800  # target characters per chunk (sentence-aware, so this is a soft target)

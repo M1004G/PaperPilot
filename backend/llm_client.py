@@ -34,7 +34,7 @@ def _get_client() -> Groq:
                 "GROQ_API_KEY is not set. Copy .env.example to .env and add your key "
                 "(get one free, no credit card required, at https://console.groq.com)."
             )
-        _client = Groq(api_key=config.GROQ_API_KEY)
+        _client = Groq(api_key=config.GROQ_API_KEY, timeout=config.LLM_TIMEOUT_SECONDS)
     return _client
 
 
