@@ -95,7 +95,14 @@ async def upload(file: UploadFile = File(...)):
     except Exception as e:
         _handle_known_errors(e)
     finally:
-        os.unlink(tmp_path)
+        try:
+            os.unlink(tmp_path)
+        except PermissionError:
+            # Windows can briefly hold a lock on the temp file after PyMuPDF
+            # touches it, even on a failed open. Not deleting it immediately
+            # isn't harmful -- it's in the OS temp dir and gets cleaned up
+            # eventually; we just don't want this to crash the request.
+            pass
 
 
 @app.get("/summary/{doc_id}")
