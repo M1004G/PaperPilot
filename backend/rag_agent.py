@@ -5,7 +5,9 @@ carries section heading + page metadata, so the LLM can ground answers in
 "where this came from" rather than an anonymous blob of text. Retrieval also
 adds an optional cross-encoder rerank pass over a wider FAISS candidate pool.
 """
+import logging
 import re
+import time
 
 import numpy as np
 import faiss
@@ -13,6 +15,8 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 
 from backend import llm_client, config
 from backend.ingestion_agent import IngestedPaper, Section
+
+logger = logging.getLogger("paperpilot.rag")
 
 _embedder = None
 _reranker = None
@@ -130,20 +134,27 @@ class RAGIndex:
         self.chunks = chunks
         embedder = _get_embedder()
         texts = [c["text"] for c in chunks]
+        t0 = time.monotonic()
         embeddings = embedder.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+        embed_elapsed = time.monotonic() - t0
         embeddings = np.asarray(embeddings, dtype="float32")
         dim = embeddings.shape[1]
         self.index = faiss.IndexFlatIP(dim)  # cosine similarity via normalized inner product
         self.index.add(embeddings)
+        logger.info("rag_index_built chunks=%d embed_elapsed=%.2fs", len(chunks), embed_elapsed)
 
     def retrieve(self, query: str, k: int = None) -> list[dict]:
         k = k or config.TOP_K
         embedder = _get_embedder()
+        t0 = time.monotonic()
         q_emb = embedder.encode([query], normalize_embeddings=True)
+        embed_elapsed = time.monotonic() - t0
         q_emb = np.asarray(q_emb, dtype="float32")
 
         pool_size = min(config.RERANK_CANDIDATE_POOL if config.RERANK_ENABLED else k, len(self.chunks))
+        t1 = time.monotonic()
         scores, indices = self.index.search(q_emb, pool_size)
+        search_elapsed = time.monotonic() - t1
 
         candidates = []
         for score, idx in zip(scores[0], indices[0]):
@@ -159,10 +170,13 @@ class RAGIndex:
                 "embedding_score": float(score),
             })
 
+        rerank_elapsed = 0.0
         if config.RERANK_ENABLED and len(candidates) > 1:
             reranker = _get_reranker()
             pairs = [[query, c["text"]] for c in candidates]
+            t2 = time.monotonic()
             rerank_scores = reranker.predict(pairs)
+            rerank_elapsed = time.monotonic() - t2
             for c, rs in zip(candidates, rerank_scores):
                 c["score"] = float(rs)
             candidates.sort(key=lambda c: c["score"], reverse=True)
@@ -170,6 +184,10 @@ class RAGIndex:
             for c in candidates:
                 c["score"] = c["embedding_score"]
 
+        logger.info(
+            "retrieve_timing embed=%.3fs search=%.3fs rerank=%.3fs candidates=%d",
+            embed_elapsed, search_elapsed, rerank_elapsed, len(candidates),
+        )
         return candidates[:k]
 
 

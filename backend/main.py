@@ -13,11 +13,17 @@ from backend import config
 from backend.orchestrator import orchestrator
 from backend.ingestion_agent import IngestionError
 from backend.llm_client import LLMProviderError
+from backend.logging_utils import new_request_id, set_request_id, get_request_id, RequestIdLogFilter
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    format="%(asctime)s %(levelname)s [%(request_id)s] %(name)s: %(message)s",
 )
+# Filters must go on the handler, not the root logger -- a logger-level filter
+# only applies to records logged directly through that logger, not ones
+# propagating up to it from child loggers (paperpilot.rag, paperpilot.llm, etc.).
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(RequestIdLogFilter())
 logger = logging.getLogger("paperpilot.api")
 
 app = FastAPI(title="PaperPilot API")
@@ -31,10 +37,13 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def log_requests(request: Request, call_next):
+async def add_request_id_and_log(request: Request, call_next):
+    request_id = request.headers.get("x-request-id") or new_request_id()
+    set_request_id(request_id)
     start = time.monotonic()
     response = await call_next(request)
     elapsed = time.monotonic() - start
+    response.headers["X-Request-ID"] = request_id
     logger.info(
         "request method=%s path=%s status=%d elapsed=%.2fs",
         request.method, request.url.path, response.status_code, elapsed,

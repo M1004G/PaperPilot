@@ -1,6 +1,7 @@
 """Orchestrator Agent: owns per-document sessions and routes work to specialist agents."""
 import logging
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 
@@ -64,8 +65,15 @@ class Orchestrator:
 
     # ---------- ingestion ----------
     def ingest_paper(self, pdf_path: str) -> dict:
+        t0 = time.monotonic()
         paper = ingestion_agent.ingest(pdf_path)
+        t1 = time.monotonic()
         rag_index = rag_agent.build_index(paper)
+        t2 = time.monotonic()
+        logger.info(
+            "ingest_timing parse=%.2fs index_build=%.2fs total=%.2fs pages=%d sections=%d chunks=%d",
+            t1 - t0, t2 - t1, t2 - t0, paper.num_pages, len(paper.sections), len(rag_index.chunks),
+        )
         doc_id = str(uuid.uuid4())[:8]
         session = DocSession(doc_id=doc_id, paper=paper, rag_index=rag_index)
         with self._lock:
@@ -89,14 +97,29 @@ class Orchestrator:
         session = self._get_session(doc_id)
         changed = False
         if session._tldr is None:
+            logger.info("cache_miss doc_id=%s field=tldr", doc_id)
+            t0 = time.monotonic()
             session._tldr = summary_agent.tldr(session.paper)
+            logger.info("stage_timing doc_id=%s stage=tldr elapsed=%.2fs", doc_id, time.monotonic() - t0)
             changed = True
+        else:
+            logger.info("cache_hit doc_id=%s field=tldr", doc_id)
         if session._section_summaries is None:
+            logger.info("cache_miss doc_id=%s field=section_summaries", doc_id)
+            t0 = time.monotonic()
             session._section_summaries = summary_agent.section_summaries(session.paper)
+            logger.info("stage_timing doc_id=%s stage=section_summaries elapsed=%.2fs", doc_id, time.monotonic() - t0)
             changed = True
+        else:
+            logger.info("cache_hit doc_id=%s field=section_summaries", doc_id)
         if session._key_findings is None:
+            logger.info("cache_miss doc_id=%s field=key_findings", doc_id)
+            t0 = time.monotonic()
             session._key_findings = summary_agent.key_findings(session.paper)
+            logger.info("stage_timing doc_id=%s stage=key_findings elapsed=%.2fs", doc_id, time.monotonic() - t0)
             changed = True
+        else:
+            logger.info("cache_hit doc_id=%s field=key_findings", doc_id)
         if changed:
             persistence.update_summary_cache(
                 doc_id, session._tldr, session._section_summaries, session._key_findings
@@ -111,8 +134,13 @@ class Orchestrator:
     def get_gaps(self, doc_id: str) -> dict:
         session = self._get_session(doc_id)
         if session._gaps is None:
+            logger.info("cache_miss doc_id=%s field=gaps", doc_id)
+            t0 = time.monotonic()
             session._gaps = gap_agent.analyze(session.paper)
+            logger.info("stage_timing doc_id=%s stage=gaps elapsed=%.2fs", doc_id, time.monotonic() - t0)
             persistence.update_gaps_cache(doc_id, session._gaps)
+        else:
+            logger.info("cache_hit doc_id=%s field=gaps", doc_id)
         return session._gaps
 
     # ---------- report ----------
