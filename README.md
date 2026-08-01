@@ -10,6 +10,20 @@ See `ARCHITECTURE.md` for the full design.
 
 ## Setup
 
+### Option A: Docker (recommended — one command, no local Python setup)
+
+```bash
+cd research-assistant
+cp .env.example .env
+# edit .env and add your GROQ_API_KEY (free, no card — https://console.groq.com)
+
+docker compose up
+```
+
+Backend: http://localhost:8000 · Frontend: http://localhost:8501 · Data persists in `./data` on your host machine across container restarts/rebuilds.
+
+### Option B: Local Python
+
 ```bash
 cd research-assistant
 python -m venv venv
@@ -21,7 +35,7 @@ cp .env.example .env
 # (free, no credit card required — get one at https://console.groq.com)
 ```
 
-## Run
+## Run (Option B — local Python only; Docker's `docker compose up` already starts both services)
 
 Terminal 1 — backend:
 ```bash
@@ -36,6 +50,21 @@ streamlit run frontend/app.py
 Open the Streamlit URL it prints (usually http://localhost:8501), upload a PDF, and use the tabs.
 
 Sessions persist across restarts in `data/sessions.db` (SQLite) — re-uploading isn't needed after a backend restart; ingested papers, cached summaries/gaps, and chat history are reloaded automatically on startup.
+
+## Testing
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+40+ tests covering ingestion (heading/page detection, validation errors),
+chunking/retrieval (sentence-aware splitting, page precision, reranking),
+persistence (temp SQLite, corrupt-row handling), `llm_client` retry/backoff
+(mocked), and end-to-end API flows (`TestClient`). No test hits a real Groq
+or Hugging Face endpoint — everything's mocked or generated locally, so the
+suite runs fast and deterministically offline. Runs automatically in CI
+(`.github/workflows/ci.yml`) on every push/PR to `main`.
 
 ## Evaluating quality
 
@@ -64,22 +93,27 @@ This uses an LLM-as-judge to score whether generated summaries/gaps/chat answers
 ```
 backend/
   config.py              # env/config loading (Groq settings, rate-limit tuning, storage, logging)
-  llm_client.py          # Groq API wrapper: retry/backoff on 429s, token-usage logging
+  llm_client.py          # Groq API wrapper: retry/backoff on 429s, timeout, token-usage logging
+  logging_utils.py       # request-ID propagation across threads/loggers via contextvars
   ingestion_agent.py     # PDF -> text, sections, per-page metadata; validates corrupt/encrypted/empty files
-  summary_agent.py       # TL;DR + section summaries (parallelized, capped concurrency)
+  summary_agent.py       # TL;DR + section summaries (parallelized, capped concurrency, per-section error isolation)
   gap_agent.py           # research gap analysis (structured JSON output, not string parsing)
   rag_agent.py           # sentence-aware chunking, section+page metadata, cross-encoder reranking, chat
   report_agent.py        # assembles final Markdown report (no LLM call — deterministic)
   persistence.py         # SQLite-backed session storage, survives server restarts
   eval_agent.py          # retrieval hit-rate + LLM-as-judge faithfulness scoring
-  orchestrator.py        # coordinates all agents, thread-safe session state
-  main.py                # FastAPI app / routes, request logging, structured error responses
+  orchestrator.py        # coordinates all agents, thread-safe session state, per-stage timing
+  main.py                # FastAPI app / routes, request-ID + logging middleware, structured error responses
 frontend/
   app.py                 # Streamlit UI
 scripts/
   run_eval.py            # CLI: run the pipeline against a PDF and print a quality report
+tests/                   # pytest suite (see Testing section below)
 data/
   sessions.db            # SQLite session store (created automatically, gitignored)
+Dockerfile               # single image, used for both backend and frontend services
+docker-compose.yml       # wires backend + frontend + a persistent ./data volume
+.github/workflows/ci.yml # runs the test suite on every push/PR
 ```
 
 ## Error handling
@@ -94,6 +128,8 @@ Every request is logged (method, path, status, timing) via middleware in `main.p
 
 ## Notes / extension points
 - `config.py` centralizes the model name (`llama-3.3-70b-versatile` on Groq by default) — change it in one place.
-- Groq's free tier is rate-limited (not credit-metered) — `llm_client.py` retries on 429s, and section summarization runs on a capped thread pool so it doesn't burst past the requests-per-minute limit.
+- Groq's free tier is rate-limited (not credit-metered) — `llm_client.py` retries on 429s (configurable timeout via `LLM_TIMEOUT_SECONDS`), and section summarization runs on a capped thread pool so it doesn't burst past the requests-per-minute limit. One section failing doesn't discard the others' results.
+- Every request gets a request ID (returned as an `X-Request-ID` header and threaded through every log line, including inside the section-summary thread pool via `contextvars`) — grep any log by request ID to see everything that happened for one request. Per-stage timing (ingestion, index build, retrieval/rerank, per-Groq-call) and cache hit/miss are all logged.
 - The FAISS index itself isn't persisted — on restart, chunks are reloaded from SQLite and re-embedded locally (no Groq calls involved, so this is cheap and avoids FAISS version/serialization issues).
-- Heading detection (`ingestion_agent.py`) still relies on a fixed list of known section names (Introduction, Results, etc.) matched via regex. Papers with unconventional headings ("Proposed Framework", "Case Study") won't be split correctly — this is a known, deliberately out-of-scope limitation; a real fix needs font/layout-based heading detection rather than a keyword list.
+- Heading detection (`ingestion_agent.py`) combines a known-heading keyword list (Introduction, Results, etc.) with font-based layout detection — a line is also treated as a heading if it's noticeably larger and/or bolder than the document's body text (or, failing that, a short ALL-CAPS line), so unconventional section names ("Proposed Framework", "Case Study") are split correctly too. This is heuristic, not perfect: papers whose headings are styled identically to body text (no size/weight/case distinction at all) still won't be split on those unconventional names — a genuinely robust fix would need a layout-ML model rather than font heuristics.
+- **Architectural tradeoffs** (see `ARCHITECTURE.md`'s Design Decisions section for the full reasoning): the `Orchestrator` centralizes session state, caching, routing, and persistence coordination — the natural next step if scope grows is splitting it into narrower services; the request path is synchronous throughout, matching the underlying libraries (PyMuPDF, SentenceTransformer, FAISS, SQLite are all sync); there's no auth layer, appropriate for local single-user use and a prerequisite for any shared deployment.
