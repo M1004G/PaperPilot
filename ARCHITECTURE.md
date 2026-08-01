@@ -8,9 +8,16 @@ Steps:
 1. Extract raw text per page with PyMuPDF, validating the file first (rejects
    corrupt, empty, and password-protected PDFs with a clear `IngestionError`
    rather than letting a raw PyMuPDF exception bubble up as a bare 500).
-2. Heuristically split into sections (Abstract, Introduction, Related Work,
-   Methodology, Results, Discussion, Limitations, Conclusion, References, ...)
-   using regex over heading-like lines (numbered / all-caps / title-case short lines).
+2. Split into sections using two combined signals: (a) regex match against a
+   known-heading keyword list (Abstract, Introduction, Related Work,
+   Methodology, Results, Discussion, Limitations, Conclusion, References, ...),
+   and (b) font-layout detection — a line whose font is noticeably larger
+   and/or bolder than the document's dominant body-text size (or, absent that,
+   a short ALL-CAPS line) is also treated as a heading. (b) lets unconventional
+   section names ("Proposed Framework", "Case Study") split correctly without
+   being in the keyword list; a numbered heading line ("3.2 Case Study") can
+   even establish section structure before any keyword-list heading has been
+   seen, for papers that don't use standard IMRaD naming at all.
 3. Track each section's text *per page* (`page_segments`), not just an overall
    page range — this lets chunks downstream carry their actual page rather than
    the whole section's span.
@@ -21,9 +28,10 @@ Output: `IngestedPaper` dataclass — `{title, abstract, sections: [{heading, te
 This is the only agent that touches the raw file. Everything downstream
 consumes its structured output, so re-parsing never happens twice.
 
-**Known limitation**: heading detection is still a fixed keyword list matched
-via regex (see Phase 1 below) — papers with unconventional heading names won't
-split correctly.
+**Known limitation**: heading detection is a font/case/keyword heuristic, not
+a true layout model — a paper whose headings are styled identically to its
+body text (same size, same weight, mixed case, not in the keyword list) still
+won't split correctly on those unconventional names.
 
 ### 2. Summary Agent (`backend/summary_agent.py`)
 - `tldr(paper)` → 1 paragraph plain-English summary.
@@ -154,26 +162,25 @@ Every write to a session (new ingestion, computed summary/gaps, appended chat
 turn) is mirrored to SQLite via the Persistence Agent, so this whole flow
 resumes correctly after a server restart without re-uploading the PDF.
 
-## V2 Roadmap
+## Roadmap
 
-The V1 implementation optimizes for a small, readable, dependency-light
-reference build. The table below captures where the current design makes
-simplifying assumptions, and the planned enhancement for each as the system
-matures toward handling arbitrary real-world papers. This is the working
-scope for the next iteration.
+The tables below track each area against its original, simpler V1 design:
+what's been implemented since, and what's intentionally still open. Phase 1
+(document understanding) is the highest-value remaining work; Phases 2-5 are
+largely complete.
 
 ### Phase 1 — Extraction & document understanding
 
-| Area | Current design (V1) | Planned enhancement (V2) | Rationale |
+| Area | Current design | Planned enhancement | Rationale |
 |---|---|---|---|
-| PDF text extraction | Single-pass linear text extraction (`page.get_text("text")`) | Layout-aware extraction using PyMuPDF's block/dict mode, with blocks sorted by column then position | Correctly orders text on two-column academic layouts (ACL/IEEE/NeurIPS style), which is the dominant format for research papers |
+| PDF text extraction | Single-pass linear text extraction (`page.get_text("text")`) | Layout-aware extraction using PyMuPDF's block/dict mode, with blocks sorted by column then position | Correctly orders text on two-column academic layouts (ACL/IEEE/NeurIPS style), which is the dominant format for research papers. **Still open** — dict-mode is now used for font metadata (see Section detection below), but blocks aren't yet reordered for two-column layouts. |
 | Scanned documents | Assumes a text layer is present | Detect low-text-density pages and fall back to OCR (e.g. Tesseract) | Extends coverage to scanned/legacy PDFs |
-| Section detection | Regex match against a curated list of common heading names | Add an LLM-guided segmentation pass as a fallback when regex detection yields too few or ambiguous sections | Covers papers using non-standard section naming (e.g. "Threats to Validity," "Broader Impact") without hand-maintaining an ever-growing heading list |
+| Section detection | ~~Regex match against a curated list of common heading names~~ | Add an LLM-guided segmentation pass as a fallback when regex/font detection yields too few or ambiguous sections | ✅ **Partially done** — keyword regex is now combined with font-layout detection (`page.get_text("dict")` font size + bold, or short ALL-CAPS lines, relative to the document's dominant body-text size), so non-standard names ("Proposed Framework," "Case Study") split correctly without being hand-added to the keyword list. Not an LLM-guided fallback, so a paper with zero visual distinction between headings and body text (same size/weight/case) still won't split on its unconventional names — that residual case is the honest remaining gap. |
 | Header/footer noise | Not filtered | Detect and strip lines repeated near-identically across pages before splitting/chunking | Keeps running headers/page numbers out of section text and chunks |
 
 ### Phase 2 — Analysis quality
 
-| Area | Original design (V1) | Status |
+| Area | Original design | Status |
 |---|---|---|
 | Document context for Summary/Gap agents | Fixed prefix of the document (first several thousand characters) | ✅ **Done** — `prioritized_excerpt()` front-loads the abstract + Limitations/Discussion/Conclusion before filling remaining budget in order, so those sections survive truncation regardless of paper length. Not a full map-reduce over every section, but directly fixes the "Limitations gets cut off" failure mode. |
 | Gap agent output format | Delimited text format (`GAP: ... \|\| CONFIDENCE: ... \|\| DIRECTION: ...`), parsed with string splitting | ✅ **Done** — structured JSON output via `llm_client.complete_json`, with malformed/invalid entries filtered rather than crashing. |
@@ -181,7 +188,7 @@ scope for the next iteration.
 
 ### Phase 3 — Retrieval quality
 
-| Area | Original design (V1) | Status |
+| Area | Original design | Status |
 |---|---|---|
 | Vector store | FAISS, in-memory, rebuilt per session | ✅ **Partially done** — sessions (and their chunks) now persist in SQLite and survive a restart; FAISS itself stays in-memory but is cheaply rebuilt from persisted chunks on load. Not a switch to ChromaDB, but achieves the actual goal (surviving a restart) without adding a new vector-store dependency. |
 | Chunking | Fixed-size character windows with overlap | ✅ **Done** — sentence-aware chunking that never splits mid-sentence, packed to a target size with overlap. |
@@ -191,14 +198,14 @@ scope for the next iteration.
 
 ### Phase 4 — Productionization (not required for single-user local use)
 
-| Area | Original plan | Status |
+| Area | Original design | Status |
 |---|---|---|
 | Session storage | Move from in-memory dict to SQLite/Redis with TTL-based eviction | ✅ **Partially done** — SQLite persistence added (`persistence.py`); no TTL-based eviction yet, so old sessions accumulate indefinitely. |
 | Access control | Add API-key/session auth if deployed beyond localhost | **Still open** — no auth; fine for local single-user use, required before any shared/public deployment. |
 | Chat responses | Stream tokens instead of returning the full answer at once | **Still open**. |
 | Observability | Token/cost logging per call; upload size and page-count limits | ✅ **Done** — every Groq call logs timing + prompt/completion/total tokens; upload size is capped (`MAX_PDF_SIZE_MB`); every API request is logged (method, path, status, timing). Dollar-cost tracking specifically isn't computed, just raw token counts. |
 | Error handling | Everything surfaces as a raw 500 | ✅ **Done** — distinct status codes for bad input (400), unknown doc (404), upstream LLM failure (502), and unexpected errors (500, logged server-side with full traceback). |
-| Testing | Unit tests for section splitting, chunking, and orchestrator routing, with the LLM client mocked | **Still open** — verified manually during development (chunking, persistence round-trip, error mapping, retry/backoff all exercised with mocked Groq/embedding calls), but there's no committed automated test suite yet. |
+| Testing | Unit tests for section splitting, chunking, and orchestrator routing, with the LLM client mocked | ✅ **Done** — 40+ pytest tests across ingestion, chunking/retrieval, persistence (temp SQLite), `llm_client` retry/backoff (mocked), and end-to-end API flows (`TestClient`). Runs in CI (`.github/workflows/ci.yml`) on every push/PR. No real network calls (Groq or Hugging Face) anywhere in the suite. |
 
 ### Phase 5 — Quality evaluation (added, not in original roadmap)
 
@@ -210,9 +217,80 @@ scope for the next iteration.
 | Ground-truth benchmark dataset | **Still open** — the eval harness is a practical regression/spot-check tool, not a rigorous benchmark against labeled correct answers. |
 
 ### Recommended next iteration scope
-With Phases 2 and most of Phase 3/4 now implemented, the highest-value remaining
-work is **Phase 1** (heading detection is still the weakest link — see the
-"Known limitation" note under the Ingestion Agent above) and building out a
-small labeled test set so the Phase 5 eval harness can report an actual
-accuracy number rather than just relative faithfulness scores.
+With Phases 2 and most of Phase 3/4 now implemented, and section detection in
+Phase 1 upgraded from keyword-only to font/layout-based, the highest-value
+remaining work is two-column layout ordering and OCR fallback (still open in
+Phase 1 — see the "Known limitation" note under the Ingestion Agent above) and
+building out a small labeled test set so the Phase 5 eval harness can report an
+actual accuracy number rather than just relative faithfulness scores.
 
+## Design decisions (the "why," not just the "what")
+
+**Why FAISS instead of Chroma/Pinecone/a hosted vector DB?**
+Each document gets its own small index (typically tens to low hundreds of
+chunks) — this isn't a shared corpus being queried across documents. FAISS's
+`IndexFlatIP` is an exact (not approximate) nearest-neighbor search, which at
+this scale is fast enough that there's no accuracy/speed tradeoff to make.
+Adding Chroma would mean a persistent service dependency for a workload that
+doesn't need one yet. If this became a multi-document, shared-corpus system,
+that calculus changes — that's a real limitation (see Phase 3), not a case
+for switching preemptively.
+
+**Why SQLite instead of Postgres?**
+Single-process, single-machine, low write-concurrency (one person uploading
+papers, not many concurrent users hammering writes). SQLite's file-based
+simplicity means zero setup — no separate DB server to run, configure, or
+containerize. Postgres would be the right call the moment this needs to serve
+multiple concurrent users or run across multiple app instances (it doesn't
+handle concurrent writers as gracefully) — that migration path is real but not
+worth pre-paying for now.
+
+**Why rebuild embeddings on restart instead of persisting the FAISS index itself?**
+FAISS index serialization is tied to the FAISS library version that wrote it,
+and re-embedding a document's chunks locally (no Groq/API calls involved) takes
+well under a second for anything this app handles. Persisting raw chunk
+text+metadata in SQLite and rebuilding the index from that on load sidesteps a
+whole category of "works on my machine, breaks after a library upgrade" bugs
+for a cost that's not actually noticeable.
+
+**Why rerank after retrieval instead of just taking top-k from FAISS directly?**
+Cosine similarity from a small bi-encoder embedding model (`all-MiniLM-L6-v2`)
+is fast but coarse — it can rank a superficially-similar-but-irrelevant chunk
+above a genuinely relevant one. A cross-encoder reranker (`ms-marco-MiniLM-L-6-v2`)
+looks at the query and chunk *together* rather than as separate vectors, which
+is slower per-comparison but much more accurate — so the pattern here is
+"cast a wide net cheaply (FAISS, top ~20), then rerank precisely on that
+smaller set" rather than doing expensive reranking over the whole document.
+
+**Why hand-rolled orchestration instead of LangChain/LangGraph/CrewAI/AutoGen?**
+Every step in this pipeline (ingest → chunk → embed → retrieve → prompt →
+parse) is a plain function call with a clear input/output contract — there's
+no dynamic agent-to-agent negotiation, tool-calling loop, or planning step that
+would benefit from a framework's abstractions. A framework here would mean
+learning and working around someone else's abstraction for orchestration logic
+that's ~150 lines of straightforward Python (`orchestrator.py`). The tradeoff
+would flip if the system needed genuine multi-step agentic planning (e.g. an
+agent deciding *which* tools to call and in what order based on intermediate
+results) — that's a different problem than this pipeline solves.
+
+**Why a thread pool for concurrency instead of async/await throughout?**
+The actual bottleneck (Groq API calls) is I/O-bound and would benefit from
+async in a fully async system, but every I/O call here already blocks
+synchronously (PyMuPDF, SentenceTransformer, FAISS, SQLite are all sync
+libraries) — converting `main.py`'s route handlers to `async def` wouldn't
+gain anything unless the *whole* chain underneath were also async, which would
+mean async wrappers or replacements for several libraries that don't offer
+them. A bounded `ThreadPoolExecutor` around the one place that's actually
+parallelizable (independent section summaries) gets most of the concurrency
+benefit without that larger rewrite. Under heavy concurrent load, this is the
+part of the design that would need revisiting first — full async support
+throughout the stack, not just at the FastAPI layer.
+
+**Design tradeoff: the Orchestrator centralizes several responsibilities.**
+It currently owns session state, caching, routing between agents, and
+persistence coordination. That's a reasonable scope for the current feature
+set, but every new capability (multi-document comparison, background jobs,
+auth) would naturally extend the same class. The clear extension point, if
+scope grows, is splitting it into narrower application services (e.g. a
+`SessionService`, a `SummaryService`) that the API layer calls directly, with
+the Orchestrator either shrinking to pure request routing or being retired.
