@@ -2,7 +2,7 @@
 import pytest
 
 from backend.ingestion_agent import ingest, IngestionError, prioritized_excerpt, IngestedPaper, Section
-from tests.conftest import make_test_pdf
+from tests.conftest import make_test_pdf, make_layout_pdf
 
 
 class TestIngest:
@@ -60,6 +60,89 @@ class TestIngest:
         doc.close()
         with pytest.raises(IngestionError, match="password"):
             ingest(path)
+
+
+class TestFontBasedHeadingDetection:
+    """Covers headings that aren't in KNOWN_HEADINGS -- these must be detected via
+    font size/weight relative to the document's body text, not keyword matching."""
+
+    def test_unconventional_heading_detected_after_a_known_heading(self, tmp_path):
+        path = make_layout_pdf(tmp_path, {
+            "Abstract": "This paper studies an interesting problem in the field.",
+            "Proposed Framework": "We describe our novel proposed framework in detail, "
+                                   "covering the architecture and training procedure.",
+            "Conclusion": "We conclude the paper with a summary of contributions.",
+        })
+        paper = ingest(path)
+        headings = [s.heading for s in paper.sections]
+        assert "Proposed Framework" in headings
+        assert "Conclusion" in headings
+
+    def test_numbered_unconventional_heading_detected_with_no_known_heading_present(self, tmp_path):
+        # No "Abstract"/"Introduction"/etc. at all -- purely numbered, unconventional
+        # section names, which the old keyword-only approach could not split at all.
+        path = make_layout_pdf(tmp_path, {
+            "1. Overview": "This work presents a new overview of the problem space.",
+            "2. Case Study": "We evaluate our approach on a real-world case study.",
+        })
+        paper = ingest(path)
+        headings = [s.heading for s in paper.sections]
+        assert "Overview" in headings
+        assert "Case Study" in headings
+
+    def test_all_caps_heading_detected_without_font_size_or_bold_difference(self, tmp_path):
+        path = make_layout_pdf(
+            tmp_path,
+            {
+                "Abstract": "This paper covers an all caps heading style test case.",
+                "PROPOSED FRAMEWORK": "We describe the framework and its components in this section.",
+            },
+            heading_fontsize=10, body_fontsize=10, heading_bold=False,
+        )
+        paper = ingest(path)
+        headings = [s.heading for s in paper.sections]
+        assert "Proposed Framework" in headings
+
+    def test_same_font_unconventional_heading_not_split_without_visual_distinction(self, tmp_path):
+        # Sanity check for the font gate itself: when a heading-like line has no
+        # font distinction from the surrounding body text AND isn't a known
+        # heading, it should stay merged into the current section rather than
+        # every capitalized short line becoming a spurious split.
+        path = make_layout_pdf(
+            tmp_path,
+            {"Abstract": "Some intro text here about the study we are conducting today."},
+            heading_fontsize=10, body_fontsize=10, heading_bold=False,
+        )
+        page_two_text = "Not A Real Heading\nJust a short line followed by more body content about our results."
+        import fitz
+        doc = fitz.open(path)
+        page = doc.new_page()
+        page.insert_text((72, 72), page_two_text, fontsize=10, fontname="helv")
+        doc.saveIncr()
+        doc.close()
+
+        paper = ingest(path)
+        headings = [s.heading for s in paper.sections]
+        assert "Not A Real Heading" not in headings
+
+    def test_figure_caption_not_misread_as_heading(self, tmp_path):
+        path = make_layout_pdf(tmp_path, {
+            "Abstract": "This paper studies an interesting problem in the field today.",
+        })
+        import fitz
+        doc = fitz.open(path)
+        page = doc.new_page()
+        page.insert_text((72, 72), "Results", fontsize=13, fontname="hebo")
+        page.insert_text((72, 100), "Our method performs well across benchmarks tested here.", fontsize=10, fontname="helv")
+        page.insert_text((72, 120), "Figure 1: Overview", fontsize=13, fontname="hebo")
+        page.insert_text((72, 140), "The figure shows accuracy improving over training epochs steadily.", fontsize=10, fontname="helv")
+        doc.saveIncr()
+        doc.close()
+
+        paper = ingest(path)
+        headings = [s.heading for s in paper.sections]
+        assert "Results" in headings
+        assert not any("figure" in h.lower() for h in headings)
 
 
 class TestPrioritizedExcerpt:

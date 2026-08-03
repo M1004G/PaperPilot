@@ -86,3 +86,31 @@ def make_test_pdf(tmp_path, sections: dict[str, str]) -> str:
     doc.save(path)
     doc.close()
     return path
+
+
+def make_layout_pdf(
+    tmp_path,
+    sections: dict[str, str],
+    heading_fontsize: float = 13,
+    body_fontsize: float = 10,
+    heading_bold: bool = True,
+    filename: str = "layout_paper.pdf",
+) -> str:
+    """Like make_test_pdf, but the heading line is styled with a distinct font
+    size/weight from the body text -- the way real paper templates distinguish
+    headings -- instead of relying only on the heading text matching a known
+    keyword. Used to test font-based heading detection for section names that
+    aren't in KNOWN_HEADINGS (e.g. "Proposed Framework")."""
+    import fitz
+    doc = fitz.open()
+    for heading, body in sections.items():
+        page = doc.new_page()
+        page.insert_text(
+            (72, 72), heading, fontsize=heading_fontsize,
+            fontname="hebo" if heading_bold else "helv",
+        )
+        page.insert_text((72, 100), body, fontsize=body_fontsize, fontname="helv")
+    path = str(tmp_path / filename)
+    doc.save(path)
+    doc.close()
+    return path
