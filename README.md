@@ -5,6 +5,7 @@ Multi-agent system that ingests a research paper (PDF) and produces:
 - A structured report (Markdown)
 - A research-gap analysis (author-acknowledged vs. critically inferred)
 - A RAG-based chatbot grounded in the paper, with section+page citations
+- A code-reproducibility check against the paper's linked GitHub repo (repo hygiene + a lightweight paper-vs-code claim check)
 
 See `ARCHITECTURE.md` for the full design.
 
@@ -98,6 +99,8 @@ backend/
   ingestion_agent.py     # PDF -> text, sections, per-page metadata; validates corrupt/encrypted/empty files
   summary_agent.py       # TL;DR + section summaries (parallelized, capped concurrency, per-section error isolation)
   gap_agent.py           # research gap analysis (structured JSON output, not string parsing)
+  repo_fetch.py          # safe, read-only GitHub access (metadata, file tree, file contents) -- no clone, no code execution
+  repro_agent.py         # code-reproducibility checks: weighted repo-hygiene checks + LLM paper-vs-code claim verification
   rag_agent.py           # sentence-aware chunking, section+page metadata, cross-encoder reranking, chat
   report_agent.py        # assembles final Markdown report (no LLM call — deterministic)
   persistence.py         # SQLite-backed session storage, survives server restarts
@@ -128,6 +131,13 @@ Every request is logged (method, path, status, timing) via middleware in `main.p
 
 ## Notes / extension points
 - `config.py` centralizes the model name (`llama-3.3-70b-versatile` on Groq by default) — change it in one place.
+
+## Reproducibility Agent
+Checks whether a paper's linked code is actually reproducible, via `GET /reproducibility/{doc_id}` (optionally `?repo_url=...` to override auto-detection):
+- **Static checks (weighted, no LLM)** — README, license (and whether it's a recognized OSI license), dependency manifest presence + how well-pinned it is, tests, CI, Dockerfile/env spec, usage instructions, archived status, CITATION file. Weighted to a 0-100 score; code-hygiene items (dependency pinning, tests, CI, manifest) are weighted heavier than documentation extras.
+- **Claim verification (one bounded LLM call, optional)** — checks whether the paper's Methods section claims are plausibly backed up by the repo's file tree/README. Toggle off with `REPRO_LLM_CLAIMS_ENABLED=false` for a static-checks-only, LLM-free run.
+- Repo access goes through GitHub's REST API only (`api.github.com` / `raw.githubusercontent.com`) — no `git clone`, no code from the target repo is ever executed. Set `GITHUB_TOKEN` in `.env` to raise the GitHub API rate limit from 60/hr to 5000/hr.
+
 - Groq's free tier is rate-limited (not credit-metered) — `llm_client.py` retries on 429s (configurable timeout via `LLM_TIMEOUT_SECONDS`), and section summarization runs on a capped thread pool so it doesn't burst past the requests-per-minute limit. One section failing doesn't discard the others' results.
 - Every request gets a request ID (returned as an `X-Request-ID` header and threaded through every log line, including inside the section-summary thread pool via `contextvars`) — grep any log by request ID to see everything that happened for one request. Per-stage timing (ingestion, index build, retrieval/rerank, per-Groq-call) and cache hit/miss are all logged.
 - The FAISS index itself isn't persisted — on restart, chunks are reloaded from SQLite and re-embedded locally (no Groq calls involved, so this is cheap and avoids FAISS version/serialization issues).

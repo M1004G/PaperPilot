@@ -40,8 +40,8 @@ if not st.session_state.doc_id:
 
 doc_id = st.session_state.doc_id
 
-tab_summary, tab_report, tab_gaps, tab_chat = st.tabs(
-    ["🧾 Summary", "📑 Report", "🔍 Research Gaps", "💬 Chat"]
+tab_summary, tab_report, tab_gaps, tab_repro, tab_chat = st.tabs(
+    ["🧾 Summary", "📑 Report", "🔍 Research Gaps", "🧪 Reproducibility", "💬 Chat"]
 )
 
 with tab_summary:
@@ -104,6 +104,46 @@ with tab_gaps:
                     st.caption("None identified.")
             except Exception as e:
                 st.error(f"Failed to get gap analysis: {e}")
+
+with tab_repro:
+    st.caption(
+        "Checks whether the paper's linked code (auto-detected, or a URL you supply below) "
+        "looks reproducible: repo hygiene (README, license, pinned deps, tests, CI) plus a "
+        "lightweight check of whether the code plausibly matches the paper's methods."
+    )
+    repo_url_override = st.text_input(
+        "Repo URL (optional — overrides auto-detection from the paper)",
+        placeholder="https://github.com/owner/repo",
+        key="repro_repo_url",
+    )
+    if st.button("Analyze reproducibility"):
+        with st.spinner("Reproducibility Agent working..."):
+            try:
+                params = {"repo_url": repo_url_override} if repo_url_override else {}
+                data = requests.get(f"{BACKEND_URL}/reproducibility/{doc_id}", params=params, timeout=60).json()
+                if not data.get("repo_metadata"):
+                    st.warning(data.get("note") or "No repository could be evaluated.")
+                else:
+                    meta = data["repo_metadata"]
+                    st.subheader(f"[{meta['full_name']}]({data['repo_url']})")
+                    score = data["score"]
+                    st.metric("Reproducibility score", f"{score}/100", data["verdict"])
+                    st.progress(score / 100)
+
+                    st.markdown("**Static checks**")
+                    icon = {"pass": "✅", "warn": "⚠️", "fail": "❌", "na": "➖"}
+                    for c in data["checks"]:
+                        st.markdown(f"{icon.get(c['status'], '•')} **{c['label']}** — {c['detail']}")
+
+                    st.markdown("**Claim verification (paper vs. code)**")
+                    if data.get("claims"):
+                        verdict_icon = {"matches": "✅", "unclear": "⚠️", "not_evident": "❌"}
+                        for item in data["claims"]:
+                            st.markdown(f"{verdict_icon.get(item['verdict'], '•')} **{item['claim']}** — {item['evidence']}")
+                    else:
+                        st.caption("No implementation claims were checked.")
+            except Exception as e:
+                st.error(f"Failed to analyze reproducibility: {e}")
 
 with tab_chat:
     st.caption("Ask questions grounded in the uploaded paper (RAG-based).")

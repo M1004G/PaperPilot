@@ -5,7 +5,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from backend import ingestion_agent, summary_agent, gap_agent, rag_agent, report_agent, persistence
+from backend import ingestion_agent, summary_agent, gap_agent, rag_agent, report_agent, repro_agent, persistence
 from backend.ingestion_agent import IngestedPaper
 from backend.rag_agent import RAGIndex
 
@@ -23,6 +23,8 @@ class DocSession:
     _section_summaries: list = None
     _key_findings: list = None
     _gaps: dict = None
+    _repro: dict = None
+    _repro_url_used: str = None  # the repo_url the cached _repro result was computed for
 
 
 class Orchestrator:
@@ -56,6 +58,8 @@ class Orchestrator:
                     _section_summaries=row["section_summaries"],
                     _key_findings=row["key_findings"],
                     _gaps=row["gaps"],
+                    _repro=row["repro"],
+                    _repro_url_used=row["repro_url_used"],
                 )
                 self.sessions[row["doc_id"]] = session
             except Exception as e:
@@ -143,17 +147,37 @@ class Orchestrator:
             logger.info("cache_hit doc_id=%s field=gaps", doc_id)
         return session._gaps
 
+    # ---------- reproducibility ----------
+    def get_reproducibility(self, doc_id: str, repo_url: str | None = None) -> dict:
+        """Cached like get_gaps, but the cache key also includes which repo_url
+        was used -- passing an explicit repo_url different from the cached run
+        (e.g. correcting a wrong auto-detected link) forces a fresh analysis."""
+        session = self._get_session(doc_id)
+        cache_valid = session._repro is not None and session._repro_url_used == repo_url
+        if not cache_valid:
+            logger.info("cache_miss doc_id=%s field=repro repo_url=%s", doc_id, repo_url)
+            t0 = time.monotonic()
+            session._repro = repro_agent.analyze(session.paper, repo_url=repo_url)
+            session._repro_url_used = repo_url
+            logger.info("stage_timing doc_id=%s stage=repro elapsed=%.2fs", doc_id, time.monotonic() - t0)
+            persistence.update_repro_cache(doc_id, session._repro, repo_url)
+        else:
+            logger.info("cache_hit doc_id=%s field=repro", doc_id)
+        return session._repro
+
     # ---------- report ----------
     def get_report(self, doc_id: str) -> str:
         session = self._get_session(doc_id)
         summary = self.get_summary(doc_id)
         gaps = self.get_gaps(doc_id)
+        repro = self.get_reproducibility(doc_id)
         return report_agent.build_report(
             paper=session.paper,
             tldr=summary["tldr"],
             section_summaries=summary["section_summaries"],
             key_findings=summary["key_findings"],
             gaps=gaps,
+            repro=repro,
         )
 
     # ---------- chat / RAG ----------

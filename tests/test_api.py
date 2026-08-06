@@ -84,6 +84,55 @@ class TestFullFlow:
         assert report_resp.status_code == 200
 
 
+class TestReproducibilityEndpoint:
+    def test_returns_note_when_no_repo_detected(self, client, tmp_path):
+        path = make_test_pdf(tmp_path, {"Abstract": "This paper studies something with no code link."})
+        with open(path, "rb") as f:
+            upload_resp = client.post("/upload", files={"file": ("paper.pdf", f, "application/pdf")})
+        doc_id = upload_resp.json()["doc_id"]
+
+        r = client.get(f"/reproducibility/{doc_id}")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["repo_metadata"] is None
+        assert data["note"]
+
+    def test_explicit_repo_url_query_param_is_used(self, client, tmp_path, monkeypatch):
+        path = make_test_pdf(tmp_path, {"Abstract": "This paper studies something interesting."})
+        with open(path, "rb") as f:
+            upload_resp = client.post("/upload", files={"file": ("paper.pdf", f, "application/pdf")})
+        doc_id = upload_resp.json()["doc_id"]
+
+        from backend import repro_agent
+        monkeypatch.setattr(
+            repro_agent, "analyze",
+            lambda paper, repo_url=None: {
+                "repo_url": repo_url, "repo_metadata": {"full_name": "foo/bar"},
+                "checks": [], "score": 90, "verdict": "Likely reproducible", "claims": [], "note": None,
+            },
+        )
+        r = client.get(f"/reproducibility/{doc_id}", params={"repo_url": "https://github.com/foo/bar"})
+        assert r.status_code == 200
+        assert r.json()["repo_url"] == "https://github.com/foo/bar"
+
+    def test_unknown_doc_id_returns_404(self, client):
+        r = client.get("/reproducibility/does-not-exist")
+        assert r.status_code == 404
+
+    def test_report_includes_reproducibility_section(self, client, tmp_path):
+        path = make_test_pdf(tmp_path, {
+            "Abstract": "This paper studies something interesting.",
+            "Methodology": "We use a novel transformer-based approach.",
+        })
+        with open(path, "rb") as f:
+            upload_resp = client.post("/upload", files={"file": ("paper.pdf", f, "application/pdf")})
+        doc_id = upload_resp.json()["doc_id"]
+
+        r = client.get(f"/report/{doc_id}")
+        assert r.status_code == 200
+        assert "## Code Reproducibility" in r.text
+
+
 class TestErrorMapping:
     def test_unknown_doc_id_returns_404(self, client):
         r = client.get("/summary/does-not-exist")

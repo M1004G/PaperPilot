@@ -121,6 +121,17 @@ def gaps(doc_id: str):
         _handle_known_errors(e)
 
 
+@app.get("/reproducibility/{doc_id}")
+def reproducibility(doc_id: str, repo_url: str | None = None):
+    """Runs (or returns the cached result of) the Reproducibility Agent.
+    Pass ?repo_url=... to check a specific repo instead of whatever (if
+    anything) is auto-detected in the paper's own text."""
+    try:
+        return orchestrator.get_reproducibility(doc_id, repo_url=repo_url)
+    except Exception as e:
+        _handle_known_errors(e)
+
+
 @app.get("/report/{doc_id}", response_class=PlainTextResponse)
 def report(doc_id: str):
     try:

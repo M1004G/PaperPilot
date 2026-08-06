@@ -8,6 +8,7 @@ def build_report(
     section_summaries: list[dict],
     key_findings: list[str],
     gaps: dict,
+    repro: dict | None = None,
 ) -> str:
     lines = [f"# {paper.title}", ""]
 
@@ -46,5 +47,41 @@ def build_report(
             lines.append(f"- {d}")
     else:
         lines.append("_No additional directions identified._")
+    lines.append("")
+
+    lines += _reproducibility_section(repro)
 
     return "\n".join(lines)
+
+
+_STATUS_ICON = {"pass": "✅", "warn": "⚠️", "fail": "❌", "na": "➖"}
+
+
+def _reproducibility_section(repro: dict | None) -> list[str]:
+    lines = ["## Code Reproducibility"]
+    if not repro:
+        lines.append("_Not evaluated._")
+        return lines
+
+    if not repro.get("repo_metadata"):
+        lines.append(f"_{repro.get('note') or 'No code repository could be evaluated.'}_")
+        return lines
+
+    lines.append(f"**Repository:** [{repro['repo_metadata']['full_name']}]({repro['repo_url']})")
+    lines.append(f"**Score:** {repro['score']}/100 — {repro['verdict']}")
+    lines.append("")
+    lines.append("### Static Checks")
+    for c in repro["checks"]:
+        lines.append(f"- {_STATUS_ICON.get(c['status'], '•')} **{c['label']}** — {c['detail']}")
+    lines.append("")
+
+    lines.append("### Claim Verification (paper vs. code)")
+    if repro.get("claims"):
+        verdict_icon = {"matches": "✅", "unclear": "⚠️", "not_evident": "❌"}
+        for item in repro["claims"]:
+            icon = verdict_icon.get(item["verdict"], "•")
+            lines.append(f"- {icon} **{item['claim']}** — {item['evidence']}")
+    else:
+        lines.append("_No implementation claims were checked (LLM claim verification disabled, or nothing extractable from the Methods section)._")
+
+    return lines

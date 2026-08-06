@@ -52,6 +52,25 @@ class TestPersistence:
         rows = persistence.load_all_sessions()
         assert rows[0]["gaps"] == gaps
 
+    def test_update_repro_cache_persists(self, temp_data_dir):
+        persistence.init_db()
+        paper = _sample_paper()
+        persistence.save_new_session("doc1", paper, [])
+        repro = {"repo_url": "https://github.com/foo/bar", "score": 80, "checks": [], "claims": []}
+        persistence.update_repro_cache("doc1", repro, "https://github.com/foo/bar")
+
+        rows = persistence.load_all_sessions()
+        assert rows[0]["repro"] == repro
+        assert rows[0]["repro_url_used"] == "https://github.com/foo/bar"
+
+    def test_repro_defaults_to_none_when_not_set(self, temp_data_dir):
+        persistence.init_db()
+        paper = _sample_paper()
+        persistence.save_new_session("doc1", paper, [])
+        rows = persistence.load_all_sessions()
+        assert rows[0]["repro"] is None
+        assert rows[0]["repro_url_used"] is None
+
     def test_update_chat_history_persists(self, temp_data_dir):
         persistence.init_db()
         paper = _sample_paper()
