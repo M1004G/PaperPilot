@@ -38,11 +38,26 @@ def _get_conn() -> sqlite3.Connection:
                 section_summaries_json TEXT,
                 key_findings_json TEXT,
                 gaps_json TEXT,
+                repro_json TEXT,
+                repro_url_used TEXT,
                 created_at TEXT NOT NULL
             )
         """)
         _conn.commit()
+        _migrate_add_column(_conn, "sessions", "repro_json", "TEXT")
+        _migrate_add_column(_conn, "sessions", "repro_url_used", "TEXT")
     return _conn
+
+
+def _migrate_add_column(conn: sqlite3.Connection, table: str, column: str, sql_type: str):
+    """Additive migration for an existing sessions.db predating this column
+    (e.g. a database created before the Reproducibility Agent was added) --
+    CREATE TABLE IF NOT EXISTS above is a no-op on an existing table, so new
+    columns need to be added explicitly rather than assumed present."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+        conn.commit()
 
 
 def init_db():
@@ -94,6 +109,16 @@ def update_gaps_cache(doc_id: str, gaps: dict):
         conn.commit()
 
 
+def update_repro_cache(doc_id: str, repro: dict, repro_url_used: str | None):
+    with _lock:
+        conn = _get_conn()
+        conn.execute(
+            "UPDATE sessions SET repro_json = ?, repro_url_used = ? WHERE doc_id = ?",
+            (json.dumps(repro), repro_url_used, doc_id),
+        )
+        conn.commit()
+
+
 def _row_to_paper(row: sqlite3.Row) -> IngestedPaper:
     data = json.loads(row["paper_json"])
     sections = [Section(**s) for s in data.get("sections", [])]
@@ -124,6 +149,8 @@ def load_all_sessions() -> list[dict]:
                 "section_summaries": json.loads(row["section_summaries_json"]) if row["section_summaries_json"] else None,
                 "key_findings": json.loads(row["key_findings_json"]) if row["key_findings_json"] else None,
                 "gaps": json.loads(row["gaps_json"]) if row["gaps_json"] else None,
+                "repro": json.loads(row["repro_json"]) if row["repro_json"] else None,
+                "repro_url_used": row["repro_url_used"],
             })
         except Exception as e:
             # A corrupt/unreadable row shouldn't take down the whole app on startup --

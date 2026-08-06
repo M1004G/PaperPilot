@@ -47,3 +47,40 @@ MAX_HISTORY_CHARS = int(os.getenv("MAX_HISTORY_CHARS", "6000"))
 # Groq's free-tier TPM cap (as low as 6000 tokens/min on some models) is the real
 # ceiling here, well below what a full paper would take -- truncation stays necessary.
 DEFAULT_MAX_TOKENS = 1500
+
+# ---------- Reproducibility Agent ----------
+# Optional: raises the GitHub API rate limit from 60/hr (unauthenticated) to
+# 5000/hr. A fine-grained PAT with no scopes (public-repo read only) is enough.
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+
+REPRO_HTTP_TIMEOUT_SECONDS = float(os.getenv("REPRO_HTTP_TIMEOUT_SECONDS", "15"))
+# Per-file byte cap when fetching README/manifest contents -- these are read
+# for static checks, not archived, so there's no need for full files.
+REPRO_MAX_FILE_BYTES = int(os.getenv("REPRO_MAX_FILE_BYTES", "200_000".replace("_", "")))
+# Cap on how many file paths we keep from the repo tree API call (very large
+# monorepos would otherwise bloat memory and any downstream LLM prompt).
+REPRO_MAX_TREE_ENTRIES = int(os.getenv("REPRO_MAX_TREE_ENTRIES", "3000"))
+# Separate, much smaller cap on how many of those paths actually get pasted
+# into the claim-verification LLM prompt.
+REPRO_MAX_TREE_ENTRIES_IN_PROMPT = int(os.getenv("REPRO_MAX_TREE_ENTRIES_IN_PROMPT", "150"))
+# The claim-verification LLM call is judgment, not a mechanical fact -- toggle
+# off to get static-checks-only (deterministic, no LLM cost/latency).
+REPRO_LLM_CLAIMS_ENABLED = os.getenv("REPRO_LLM_CLAIMS_ENABLED", "true").lower() == "true"
+
+# ---------- Codegen Agent ----------
+# Runs when no repo is linked/found for a paper: extracts structured methodology
+# info, then generates an implementation attempt from it (checked by the same
+# repro_check_agent used for real repos).
+CODEGEN_ENABLED = os.getenv("CODEGEN_ENABLED", "true").lower() == "true"
+CODEGEN_MAX_INPUT_CHARS = int(os.getenv("CODEGEN_MAX_INPUT_CHARS", "20000"))
+CODEGEN_EXTRACT_MAX_TOKENS = int(os.getenv("CODEGEN_EXTRACT_MAX_TOKENS", "1500"))
+# Planning stage (file list + dependencies, adapted from PaperCoder/Paper2Code)
+# runs before any code is written; generation is then one call PER FILE (not
+# one call for all files) so each file gets its own token budget and can see
+# its dependencies' actual content.
+CODEGEN_PLAN_MAX_TOKENS = int(os.getenv("CODEGEN_PLAN_MAX_TOKENS", "800"))
+CODEGEN_PER_FILE_MAX_TOKENS = int(os.getenv("CODEGEN_PER_FILE_MAX_TOKENS", "1800"))
+CODEGEN_MAX_FILES = int(os.getenv("CODEGEN_MAX_FILES", "8"))
+# Below this length, generated file content is treated as a refusal/empty
+# response rather than real output (see codegen_agent._looks_like_refusal_or_empty).
+CODEGEN_MIN_FILE_CHARS = int(os.getenv("CODEGEN_MIN_FILE_CHARS", "20"))
