@@ -49,7 +49,7 @@ with tab_summary:
         with st.spinner("Summary Agent working..."):
             try:
                 data = requests.get(f"{BACKEND_URL}/summary/{doc_id}", timeout=120).json()
-                st.subheader("TL;DR")
+                st.subheader("Concise Overview")
                 st.write(data["tldr"])
 
                 st.subheader("Key Findings")
@@ -107,43 +107,74 @@ with tab_gaps:
 
 with tab_repro:
     st.caption(
-        "Checks whether the paper's linked code (auto-detected, or a URL you supply below) "
-        "looks reproducible: repo hygiene (README, license, pinned deps, tests, CI) plus a "
-        "lightweight check of whether the code plausibly matches the paper's methods."
+        "If the paper links a real GitHub repo, checks its hygiene (README, license, pinned deps, "
+        "tests, CI) plus whether it plausibly matches the paper's claims. If not, PaperPilot "
+        "generates an implementation attempt from the methodology and evaluates that instead — "
+        "either way, one score for how much you should trust the code."
     )
     repo_url_override = st.text_input(
-        "Repo URL (optional — overrides auto-detection from the paper)",
+        "Repo URL (optional — overrides auto-detection / triggers a repo check instead of generation)",
         placeholder="https://github.com/owner/repo",
         key="repro_repo_url",
     )
-    if st.button("Analyze reproducibility"):
-        with st.spinner("Reproducibility Agent working..."):
+    if st.button("Run reproducibility check"):
+        with st.spinner("Working... this may take a minute if generating code."):
             try:
                 params = {"repo_url": repo_url_override} if repo_url_override else {}
-                data = requests.get(f"{BACKEND_URL}/reproducibility/{doc_id}", params=params, timeout=60).json()
-                if not data.get("repo_metadata"):
-                    st.warning(data.get("note") or "No repository could be evaluated.")
-                else:
-                    meta = data["repo_metadata"]
-                    st.subheader(f"[{meta['full_name']}]({data['repo_url']})")
-                    score = data["score"]
-                    st.metric("Reproducibility score", f"{score}/100", data["verdict"])
-                    st.progress(score / 100)
-
-                    st.markdown("**Static checks**")
-                    icon = {"pass": "✅", "warn": "⚠️", "fail": "❌", "na": "➖"}
-                    for c in data["checks"]:
-                        st.markdown(f"{icon.get(c['status'], '•')} **{c['label']}** — {c['detail']}")
-
-                    st.markdown("**Claim verification (paper vs. code)**")
-                    if data.get("claims"):
-                        verdict_icon = {"matches": "✅", "unclear": "⚠️", "not_evident": "❌"}
-                        for item in data["claims"]:
-                            st.markdown(f"{verdict_icon.get(item['verdict'], '•')} **{item['claim']}** — {item['evidence']}")
-                    else:
-                        st.caption("No implementation claims were checked.")
+                st.session_state["repro_data"] = requests.get(
+                    f"{BACKEND_URL}/reproducibility/{doc_id}", params=params, timeout=180
+                ).json()
             except Exception as e:
-                st.error(f"Failed to analyze reproducibility: {e}")
+                st.error(f"Failed to run reproducibility check: {e}")
+
+    data = st.session_state.get("repro_data")
+    if data:
+        if data.get("note") and not data.get("checks"):
+            st.warning(data["note"])
+        else:
+            if data.get("mode") == "repo_check":
+                meta = data["repo_metadata"]
+                st.subheader(f"[{meta['full_name']}]({data['repo_url']})")
+            else:
+                st.subheader("Generated implementation (no repo was linked)")
+                st.caption("PaperPilot wrote this from the paper's methodology section — review before trusting it.")
+
+            score = data["score"]
+            st.metric("Reproducibility score", f"{score}/100", data["verdict"])
+            st.progress(score / 100)
+
+            st.markdown("**Static checks**")
+            icon = {"pass": "✅", "warn": "⚠️", "fail": "❌", "na": "➖"}
+            for c in data["checks"]:
+                st.markdown(f"{icon.get(c['status'], '•')} **{c['label']}** — {c['detail']}")
+
+            st.markdown("**Claim verification (paper vs. code)**")
+            if data.get("claims"):
+                verdict_icon = {"matches": "✅", "unclear": "⚠️", "not_evident": "❌"}
+                for item in data["claims"]:
+                    st.markdown(f"{verdict_icon.get(item['verdict'], '•')} **{item['claim']}** — {item['evidence']}")
+            else:
+                st.caption("No implementation claims were checked.")
+
+            if data.get("mode") == "generated" and data.get("files"):
+                st.markdown("---")
+                st.markdown(data.get("gap_report") or "")
+                st.markdown("### Generated Code")
+
+                try:
+                    zip_resp = requests.get(f"{BACKEND_URL}/reproducibility/{doc_id}/download", timeout=30)
+                    st.download_button(
+                        "⬇️ Download all files (.zip)", data=zip_resp.content,
+                        file_name=f"paperpilot_{doc_id}_generated.zip", mime="application/zip",
+                    )
+                except Exception as e:
+                    st.caption(f"(Download unavailable: {e})")
+
+                lang_by_ext = {".py": "python", ".txt": "text", ".md": "markdown", ".json": "json", ".yml": "yaml", ".yaml": "yaml"}
+                for filename in sorted(data["files"]):
+                    with st.expander(f"📄 {filename}"):
+                        ext = "." + filename.rsplit(".", 1)[-1] if "." in filename else ""
+                        st.code(data["files"][filename], language=lang_by_ext.get(ext, "text"))
 
 with tab_chat:
     st.caption("Ask questions grounded in the uploaded paper (RAG-based).")

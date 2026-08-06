@@ -3,13 +3,15 @@ import logging
 import os
 import tempfile
 import time
+import io
+import zipfile
 
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, Response
+from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-from backend import config
+from backend import config, codegen_agent
 from backend.orchestrator import orchestrator
 from backend.ingestion_agent import IngestionError
 from backend.llm_client import LLMProviderError
@@ -123,13 +125,55 @@ def gaps(doc_id: str):
 
 @app.get("/reproducibility/{doc_id}")
 def reproducibility(doc_id: str, repo_url: str | None = None):
-    """Runs (or returns the cached result of) the Reproducibility Agent.
-    Pass ?repo_url=... to check a specific repo instead of whatever (if
-    anything) is auto-detected in the paper's own text."""
+    """Runs (or returns the cached result of) the Reproducibility Suite.
+    If a repo is linked/supplied, evaluates it directly. Otherwise, generates
+    an implementation attempt from the paper and evaluates that instead --
+    see the response's "mode" field ("repo_check" | "generated").
+    Pass ?repo_url=... to check a specific repo instead of auto-detection."""
     try:
         return orchestrator.get_reproducibility(doc_id, repo_url=repo_url)
     except Exception as e:
         _handle_known_errors(e)
+
+
+@app.get("/reproducibility/{doc_id}/download")
+def reproducibility_download(doc_id: str):
+    """Zips up the generated code files (mode == 'generated' only) for download.
+    Serves whatever was already computed by GET /reproducibility/{doc_id} --
+    does NOT trigger a fresh run, since that could silently switch modes."""
+    try:
+        repro = orchestrator.get_cached_reproducibility(doc_id)
+    except Exception as e:
+        _handle_known_errors(e)
+        return
+    if not repro or repro.get("mode") != "generated" or not repro.get("files"):
+        raise HTTPException(
+            status_code=404,
+            detail="No generated code files are available. Call GET /reproducibility/{doc_id} first.",
+        )
+
+    buf = io.BytesIO()
+    written_any = False
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for filename, content in repro["files"].items():
+            # Defense in depth: codegen_agent.plan_files() already sanitizes
+            # filenames before generation, but these files come back out of
+            # cached/persisted storage here, not directly from that function's
+            # return value -- re-checking rather than trusting storage keeps
+            # a single missed layer from being enough to write outside the zip.
+            safe_name = codegen_agent.sanitize_filename(filename)
+            if safe_name is None:
+                logger.warning("reproducibility_download_dropped_unsafe_filename doc_id=%s filename=%r", doc_id, filename)
+                continue
+            zf.writestr(safe_name, content)
+            written_any = True
+    if not written_any:
+        raise HTTPException(status_code=404, detail="No valid generated files were available to download.")
+    buf.seek(0)
+    return StreamingResponse(
+        buf, media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename=paperpilot_{doc_id}_generated.zip"},
+    )
 
 
 @app.get("/report/{doc_id}", response_class=PlainTextResponse)

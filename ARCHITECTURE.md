@@ -76,13 +76,17 @@ renders a single Markdown report with consistent structure:
 
 ```
 # <Title>
-## TL;DR
+## Concise Overview
 ## Section Summaries
 ## Key Findings
 ## Research Gaps
   ### Author-Acknowledged
   ### Inferred
 ## Suggested Future Directions
+## Code Reproducibility
+  ### Static Checks
+  ### Claim Verification (paper vs. code)
+  ### Extraction Gaps / Generated Files (mode == "generated" only)
 ```
 
 No fresh "write a report" LLM call — this avoids the report drifting from what
@@ -93,10 +97,22 @@ the Summary/Gap tabs already showed the user.
   `IngestedPaper`, the RAG index, cached summary/gap results, and chat history.
 - All access to `self.sessions` goes through a `threading.Lock`, since FastAPI's
   sync endpoints run on a threadpool and can hit the dict concurrently.
-- Public methods: `ingest_paper`, `get_summary`, `get_gaps`, `get_report`, `chat`.
-- Lazily computes and caches summary/gaps on first request per document, so
-  uploading is fast and analysis happens on demand. Every cache update is also
-  persisted (see Persistence Agent below).
+- Public methods: `ingest_paper`, `get_summary`, `get_gaps`, `get_reproducibility`,
+  `get_cached_reproducibility`, `get_report`, `chat`.
+- Lazily computes and caches summary/gaps/reproducibility on first request per
+  document, so uploading is fast and analysis happens on demand. Every cache
+  update is also persisted (see Persistence Agent below).
+- `get_reproducibility(doc_id, repo_url=None)` is where the two Reproducibility
+  Suite sources get unified: if a repo is linked in the paper or supplied
+  explicitly, it's fetched and checked; otherwise the Codegen Agent generates
+  an implementation and that gets checked instead — either path ends at the
+  same `repro_check_agent.evaluate()` call, so the response shape (and what
+  "trustworthy" means) is identical either way, distinguished only by a `mode`
+  field (`"repo_check"` | `"generated"`). Cache key includes `repo_url`, so
+  supplying a different one forces a fresh run. `get_cached_reproducibility`
+  returns whatever's cached *without* triggering a run — used by the download
+  endpoint so it can never silently switch modes underneath an already-shown
+  result (see the API layer note below for why that distinction exists).
 - On startup, rehydrates every previously-persisted session from SQLite —
   ingested papers, cached summaries/gaps, and chat history survive a restart.
 
@@ -105,6 +121,17 @@ Thin REST wrapper around the orchestrator:
 - `POST /upload` → `{doc_id, title, num_pages, sections}`
 - `GET /summary/{doc_id}`
 - `GET /gaps/{doc_id}`
+- `GET /reproducibility/{doc_id}` (optional `?repo_url=...`) → runs (or
+  returns the cached result of) the Reproducibility Suite; response includes
+  `mode`, `checks`, `score`, `verdict`, `claims`, and (mode == `"generated"`
+  only) `paper_info`, `files`, `gap_report`.
+- `GET /reproducibility/{doc_id}/download` → zips `mode == "generated"`
+  files for download. Deliberately calls `get_cached_reproducibility` rather
+  than `get_reproducibility` — the latter, called with its default
+  `repo_url=None`, could silently re-run analysis in a *different* mode than
+  what the UI had just displayed (e.g. flip from a specific repo check back
+  to code generation) and serve mismatched files. Returns 404 if nothing's
+  been computed yet rather than triggering a fresh run as a side effect.
 - `GET /report/{doc_id}` (markdown text) and `GET /report/{doc_id}/download` (file)
 - `POST /chat` `{doc_id, query, history}` → `{answer, sources}`
 
@@ -117,17 +144,25 @@ request's method, path, status, and timing.
 
 ### 8. Frontend (`frontend/app.py`, Streamlit)
 - Upload widget → calls `/upload`, stores `doc_id` in `st.session_state`.
-- Tabs: **Summary**, **Report** (with download button), **Research Gaps**, **Chat**.
+- Tabs: **Summary**, **Report** (with download button), **Research Gaps**,
+  **Reproducibility** (repo hygiene/claim checks, or — with no linked repo —
+  generated code in an inline syntax-highlighted viewer + zip download),
+  **Chat**.
 - Chat tab keeps its own message history in session state and displays
   retrieved source snippets under each answer.
 
 ### 9. Persistence Agent (`backend/persistence.py`)
 SQLite-backed store (`data/sessions.db`) so a server restart doesn't lose
 everything. Persists the ingested paper (as JSON), chunk text+metadata,
-chat history, and cached summary/gap results. The FAISS index itself is
+chat history, cached summary/gap results, and cached reproducibility results
+(`repro_json` + which `repro_url_used` produced them, so the cache-validity
+check in the Orchestrator survives a restart too). The FAISS index itself is
 *not* serialized — on load, chunks are re-embedded locally via the same
 embedding model, which is cheap (no Groq calls) and avoids FAISS
 version/serialization compatibility issues across restarts or machines.
+New columns are added via an additive `ALTER TABLE` migration on startup, so
+a `sessions.db` created before the Reproducibility Suite existed still loads
+without error.
 
 ### 10. Eval Agent (`backend/eval_agent.py`) + `scripts/run_eval.py`
 A practical quality-check tool, not a formal benchmark (no labeled dataset):
@@ -140,20 +175,113 @@ A practical quality-check tool, not a formal benchmark (no labeled dataset):
 - `scripts/run_eval.py` is a CLI: point it at a PDF (optionally with a JSON
   file of test questions) and it prints a full report.
 
+### 11. Reproducibility Check Agent (`backend/repro_check_agent.py`) + Repo Fetch (`backend/repo_fetch.py`)
+Answers "can I trust/reuse this code?" — **source-agnostic**: it operates on
+a plain `(tree: list[str], get_content: Callable[[str], str | None], metadata:
+dict | None)` triple, not on GitHub specifically. Two things can feed it (see
+Orchestrator below): a real repo, or code the Codegen Agent just wrote. This
+is a deliberate design choice, not an accident of implementation order — see
+"Why one checker for both real and generated code?" below.
+- **Static checks (weighted, no LLM)** — README, license (+ whether it's a
+  recognized OSI license), dependency manifest presence + pinning ratio,
+  tests, CI config, Dockerfile/env spec, usage instructions in the README,
+  archived status, CITATION file. Weighted to a 0-100 score; code-hygiene
+  items (pinning, tests, CI, manifest) outweigh documentation extras. Checks
+  that need repo metadata (license identifier, archived status) return `na`
+  rather than `fail` when metadata is absent (i.e. for generated code, which
+  has no such metadata) — an absent signal isn't the same as a bad one.
+- **Claim verification (one bounded LLM call, optional)** — given the paper's
+  Methods section and the codebase's file tree/README, judges whether each of
+  up to 5 extracted implementation claims (e.g. "uses a transformer encoder")
+  is `matches` / `unclear` / `not_evident`. Toggle off with
+  `REPRO_LLM_CLAIMS_ENABLED=false` for a static-checks-only, LLM-free run.
+- `repo_fetch.py` is the GitHub-backed source: reads a repo's metadata, file
+  tree, and individual file contents entirely through GitHub's REST API
+  (`api.github.com` / `raw.githubusercontent.com`) — **no `git clone`, no code
+  from the target repo is ever executed.** Only `github.com` URLs are
+  accepted (the SSRF boundary), requests are timeout-bounded, and file/tree
+  sizes are capped. `extract_code_url()` scans the paper's own text for a
+  linked repo; a user-supplied `repo_url` overrides that.
+
+**Known limitation**: this checks whether code *looks* trustworthy and
+plausible against the paper's claims — it never runs anything, so it cannot
+confirm the code actually produces the paper's reported numbers. See the
+Codegen Agent's limitation note and the Phase 6 roadmap entry below.
+
+### 12. Codegen Agent (`backend/codegen_agent.py`)
+Runs when no repo is linked to a paper (the common case — most ML papers
+don't release code). Rather than just reporting "no code found," this
+generates an implementation attempt from the methodology itself, which is
+then hygiene/claim-checked by the *same* Reproducibility Check Agent used for
+a real repo. Four stages; the first three are adapted from PaperCoder/Paper2Code
+(https://github.com/going-doer/Paper2Code) — see the design decision below
+for what was and wasn't ported from it:
+1. **Extract** — one LLM call turns the paper's methodology/experiments text
+   into structured JSON: datasets, model architecture, training config,
+   evaluation, and an explicit `gaps` list for anything the paper didn't
+   specify (never silently invented as a stated fact).
+2. **Plan** — one LLM call decides the file set (typically 4-7 files) and
+   each file's purpose and dependencies on the other planned files, *before*
+   any code is written. Falls back to a fixed default plan
+   (`dataset.py`/`model.py`/`train.py`/`requirements.txt`/`README.md`) if
+   this call fails or returns something unusable, so generation never
+   silently produces nothing. Each candidate filename is passed through
+   `sanitize_filename()` (flat, single-directory names only — no `../`,
+   no absolute paths, no nested directories) and deduplicated (first
+   occurrence wins, later duplicates dropped with a logged warning) before
+   being accepted into the plan; a `depends_on` entry can only reference
+   another filename that itself survived this same filtering.
+3. **Generate** — one LLM call *per file*, in dependency order (topological
+   sort via Kahn's algorithm; falls back to the plan's declared order on a
+   cycle). A file's prompt includes the actual content of the files it
+   depends on, so e.g. `train.py` is written having seen `model.py`'s real
+   class/function names rather than guessing them independently. This
+   replaces a weaker earlier version that asked one call to emit all files
+   at once, splitting a single token budget across every file and giving
+   each file zero visibility into the others.
+4. **Validate** — output isn't stored just because the LLM returned
+   something. Refusal-shaped or suspiciously short content (checked by
+   `_looks_like_refusal_or_empty()` — opens with a refusal phrase, or is
+   under `CODEGEN_MIN_FILE_CHARS`) is dropped immediately, no retry, the
+   same way a raised exception during generation is already handled. Every
+   `.py` file is additionally passed through `compile(content, filename,
+   "exec")`; a `SyntaxError` triggers exactly one retry with the broken
+   attempt and the real error message included in the follow-up prompt —
+   a concrete, fixable signal, unlike a refusal. A file still broken after
+   the retry (or whose retry call itself fails) is dropped rather than
+   silently stored, so the Reproducibility Check Agent's checks — and the
+   person reading them — never end up trusting code that was never
+   actually valid Python in the first place.
+
+Generated files are handed to `repro_check_agent.evaluate()` exactly like a
+fetched repo — same checks, same score, same claim verification against the
+paper. Output also includes a gap report (from the `gaps` list) surfacing
+what had to be assumed. Toggle off entirely with `CODEGEN_ENABLED=false`.
+
+**Known limitation, by design**: validation here is syntactic, not semantic
+— `compile()` confirms a file *parses*, not that it runs correctly or
+produces the paper's reported results. Generated code is still **never
+executed**, neither during generation nor during checking (see "Why doesn't
+this execute code?" below); treat it as a documented starting point to
+review and run yourself, not a verified reproduction.
+
 ## Data flow for a single user session
 
 ```
 upload PDF ─▶ Ingestion Agent ─▶ IngestedPaper
                                      │
-             ┌───────────────────────┼───────────────────────┐
-             ▼                       ▼                       ▼
-       Summary Agent            Gap Agent                RAG Agent
-             │                       │                    (index built,
-             ▼                       ▼                     idle until chat)
-        cached summary        cached gap analysis
-             └───────────┬───────────┘
+             ┌───────────────────────┼───────────────────────┬───────────────────────┐
+             ▼                       ▼                       ▼                       ▼
+       Summary Agent            Gap Agent                RAG Agent          Reproducibility Suite
+             │                       │                    (index built,      (repo linked? fetch it
+             ▼                       ▼                     idle until chat)   : else Codegen Agent
+        cached summary        cached gap analysis                             generates code)
+             └───────────┬───────────┘                                              │
+                         ▼                                                          ▼
+                   Report Agent ◀───────────────────────────────────── repro_check_agent.evaluate()
+                         │                                              (same checks either way)
                          ▼
-                   Report Agent ──▶ Markdown report (view / download)
+                Markdown report (view / download)
 
 chat query ──▶ Orchestrator ──▶ RAG Agent.answer() ──▶ Groq ──▶ answer + sources
 ```
@@ -216,13 +344,27 @@ largely complete.
 | CLI harness | ✅ **Done** — `scripts/run_eval.py` runs the full pipeline against a PDF and prints a report; supports an optional test-question file and a JSON report export. |
 | Ground-truth benchmark dataset | **Still open** — the eval harness is a practical regression/spot-check tool, not a rigorous benchmark against labeled correct answers. |
 
+### Phase 6 — Reproducibility Suite (added, not in original roadmap)
+
+| Area | Status |
+|---|---|
+| Repo hygiene checking | ✅ **Done** — weighted static checks (README, license, pinned deps, tests, CI, Dockerfile, CITATION), source-agnostic so the same checks apply to a real repo or generated code. |
+| Claim verification | ✅ **Done** — one bounded LLM call judging whether the codebase plausibly implements paper claims; toggleable. |
+| Code generation when no repo exists | ✅ **Done** — extract → plan → per-file dependency-ordered generation (see Codegen Agent above). |
+| Actually running generated/fetched code | **Still open, by design** — no execution happens anywhere in this suite (see design decision below). Generated `.py` files are syntax-validated (`compile()`, with a one-retry-on-error loop) before being accepted, which catches "doesn't even parse" — a real but narrow guarantee, not a substitute for running it. This is still the largest real gap versus what "reproducibility" fully means: a high score here means "looks trustworthy/complete and at least parses," not "confirmed to produce the paper's numbers." |
+| Reference-code retrieval (RAG over other implementations, à la DeepCode) | **Still open** — would need a search API dependency and materially larger LLM budget; a deliberate scoping decision for a lightweight app on Groq's free tier, not an oversight. |
+| Config/architecture-diagram generation (à la PaperCoder's planning stage) | **Partially done** — the Plan stage produces a file list + dependencies (a plan), not an architecture diagram or a generated config file. |
+
 ### Recommended next iteration scope
 With Phases 2 and most of Phase 3/4 now implemented, and section detection in
 Phase 1 upgraded from keyword-only to font/layout-based, the highest-value
 remaining work is two-column layout ordering and OCR fallback (still open in
-Phase 1 — see the "Known limitation" note under the Ingestion Agent above) and
-building out a small labeled test set so the Phase 5 eval harness can report an
-actual accuracy number rather than just relative faithfulness scores.
+Phase 1 — see the "Known limitation" note under the Ingestion Agent above),
+building out a small labeled test set so the Phase 5 eval harness can report
+an actual accuracy number rather than just relative faithfulness scores, and
+— for Phase 6 — sandboxed execution of generated/fetched code (see "Why
+doesn't this execute code?" below) if the reproducibility score needs to mean
+more than "looks complete."
 
 ## Design decisions (the "why," not just the "what")
 
@@ -294,3 +436,55 @@ auth) would naturally extend the same class. The clear extension point, if
 scope grows, is splitting it into narrower application services (e.g. a
 `SessionService`, a `SummaryService`) that the API layer calls directly, with
 the Orchestrator either shrinking to pure request routing or being retired.
+
+**Why one checker for both real and generated code, instead of two separate features?**
+The first version of this built them as disconnected features: a "check a
+linked repo" agent and, separately, a code generator. That's the wrong shape
+for what a researcher actually asks, which is really one question with two
+entry points — *"can I trust/reuse code for this paper?"* — not two unrelated
+questions. Since a linked repo is the exception rather than the rule for ML
+papers, most of the time there's nothing to check at all under the two-feature
+version. Making `repro_check_agent.evaluate()` source-agnostic (it takes a
+plain `tree` + `get_content` + optional `metadata`, not GitHub-specific
+arguments) means a generated implementation gets scored by the *same* rubric
+as a real repo — same static checks, same claim verification — so "trustworthy"
+means one consistent thing, and the generator gets honest self-evaluation
+instead of handing back code and hoping for the best.
+
+**Why plan-then-generate per-file, instead of one call producing every file?**
+The first version of the Codegen Agent asked a single LLM call to emit a JSON
+object containing all ~5 files at once. Two failure modes came from that: the
+fixed token budget was split across every file (each file starved of output
+length), and files were generated blind to each other, so `train.py` might
+reference a class name `model.py` never actually defined. Adopting the
+planning-then-generation shape from PaperCoder/Paper2Code
+(https://github.com/going-doer/Paper2Code) — decide the file set and
+dependencies first, then generate each file in dependency order with its
+dependencies' real content in context — fixes both: each file gets its own
+budget, and later files are written having actually seen the earlier ones.
+What wasn't ported from PaperCoder: a separate per-file "analysis" pass
+(inputs/outputs/interactions documented before code is written) and
+architecture-diagram/config-file generation — the plan step here folds
+"what should this file do and depend on" into one lighter call rather than
+a separate analysis stage, which is a reasonable scope cut for a 4-7-file
+implementation attempt rather than a full research-codebase scaffold.
+
+**Why doesn't this execute code?**
+Two different reasons, for the two sources. For a *fetched* repo: this is a
+backend service accepting a URL that ultimately traces back to whatever a
+paper's authors linked — running arbitrary code pulled from the internet
+unsandboxed is a real security risk, and doing it safely (Docker isolation,
+resource limits, network egress control) is a substantial system in its own
+right, not a small addition. For *generated* code: even sandboxed, "does it
+run" doesn't mean "does it reproduce the paper's numbers" — that needs the
+actual dataset, real compute (often a GPU this app doesn't assume), and a
+tolerance band for what counts as a match, none of which a generated
+`train.py` can supply on its own. AI4Reproducibility (github.com/sistm/AI4Reproducibility),
+one of the projects this suite drew inspiration from, treats their
+Docker-based execution agent as optional and explicitly calls its pass/fail
+threshold "uncalibrated" — i.e., even a project built specifically around
+execution doesn't yet trust the signal it produces. So the current scope is
+static/structural trust signals (does this look complete, does it look like
+what the paper describes) rather than a weaker, false-confidence "verified"
+badge. Sandboxed execution is the clear next-scope item if that stronger
+guarantee becomes the actual goal (see Phase 6 in the Roadmap above).

@@ -1,37 +1,40 @@
-"""Reproducibility Agent: assesses whether a paper's linked code repo is
-actually reproducible.
+"""Reproducibility Check Agent: source-agnostic code-quality checks + claim
+verification.
 
-Two layers, deliberately kept separate (same split as gap_agent's
-author-acknowledged vs. inferred, or AI4Reproducibility's deterministic
-checks vs. bounded LLM judges):
+Deliberately doesn't know or care where the code came from -- it operates on
+a plain (paths, get_content, metadata) triple. Two sources feed it:
+- repo_fetch.py (a real GitHub repo linked in the paper)
+- codegen_agent.py (code PaperPilot generated itself, when no repo exists)
 
-1. STATIC CHECKS (primary, no LLM) -- mechanical facts about repo hygiene:
-   README, license, pinned dependencies, tests, CI, Dockerfile, etc. These
-   are cheap, deterministic, and never hallucinate.
-2. CLAIM VERIFICATION (secondary, one bounded LLM call) -- does the repo's
-   structure/README plausibly support what the paper's Methodology section
-   *claims* was implemented? This is judgment, not a mechanical fact, so it's
-   scoped to a single rubric-style call whose output is treated as one
-   input among several, not a verdict on its own.
+That's the point: the same "is this trustworthy/complete" checks apply
+whether the code is someone else's or ours, so trust is scored consistently
+either way instead of two disconnected notions of "reproducible."
 
-No code from the target repo is ever executed -- see repo_fetch.py.
+Two layers, kept separate (same split as gap_agent's author-acknowledged vs.
+inferred):
+1. STATIC CHECKS (primary, no LLM) -- mechanical facts about hygiene: README,
+   license, pinned dependencies, tests, CI, Dockerfile, etc.
+2. CLAIM VERIFICATION (secondary, one bounded LLM call) -- does the code
+   plausibly support what the paper's Methodology section *claims* was
+   implemented? Judgment, not a mechanical fact, so it's scoped to a single
+   rubric-style call treated as one input among several, not a verdict alone.
 """
 import json
 import logging
 from dataclasses import dataclass, field
+from typing import Callable
 
-from backend import config, llm_client, repo_fetch
+from backend import config, llm_client
 from backend.ingestion_agent import IngestedPaper
-from backend.repo_fetch import RepoFetchError
 
-logger = logging.getLogger("paperpilot.repro")
+logger = logging.getLogger("paperpilot.repro_check")
 
 CLAIM_SYSTEM_PROMPT = (
-    "You are a careful, skeptical code reviewer checking whether a paper's released "
-    "code plausibly implements what the paper describes. You only have the repo's file "
-    "listing and README, not the full code, so you flag things as 'unclear' rather than "
-    "guessing when the file tree/README genuinely doesn't say enough. You never claim a "
-    "match unless the file tree or README gives concrete evidence for it."
+    "You are a careful, skeptical code reviewer checking whether a codebase plausibly "
+    "implements what a paper describes. You only have a file listing and a README/excerpt, "
+    "not the full code, so you flag things as 'unclear' rather than guessing when the "
+    "evidence genuinely doesn't say enough. You never claim a match unless the file "
+    "listing or README/excerpt gives concrete evidence for it."
 )
 
 METHOD_HEADINGS = {
@@ -39,9 +42,8 @@ METHOD_HEADINGS = {
     "experimental setup", "experiments", "implementation",
 }
 
-# (check_id, label, weight) -- weight reflects how heavily code-reproducibility
-# hygiene should count vs. "nice to have" documentation extras. Weights sum to
-# 100 so the aggregate score is already a percentage.
+# Weights sum to 100 so the aggregate score is already a percentage. Code-hygiene
+# items (pinning, tests, CI, manifest) are weighted heavier than doc extras.
 _CHECK_WEIGHTS = {
     "has_readme": 10,
     "has_license": 10,
@@ -65,6 +67,8 @@ RECOGNIZED_LICENSES = {
     "lgpl-3.0", "mpl-2.0", "cc0-1.0", "cc-by-4.0", "unlicense",
 }
 
+GetContent = Callable[[str], str | None]
+
 
 @dataclass
 class CheckResult:
@@ -75,18 +79,7 @@ class CheckResult:
     weight: int = 0
 
 
-@dataclass
-class ReproReport:
-    repo_url: str | None
-    repo_metadata: dict | None
-    checks: list[CheckResult] = field(default_factory=list)
-    score: int | None = None  # 0-100, weighted static-check score
-    verdict: str | None = None
-    claims: list[dict] = field(default_factory=list)
-    note: str | None = None  # set when there's no repo to analyze / a fetch error occurred
-
-
-def _find_manifest_path(tree: list[str]) -> str | None:
+def find_manifest_path(tree: list[str]) -> str | None:
     """First dependency manifest found, preferring root-level files over
     ones buried in subdirectories (a manifest in examples/ or a vendored
     dependency isn't the project's real one)."""
@@ -99,7 +92,7 @@ def _find_manifest_path(tree: list[str]) -> str | None:
     return None
 
 
-def _find_readme_path(tree: list[str]) -> str | None:
+def find_readme_path(tree: list[str]) -> str | None:
     for path in tree:
         if "/" not in path and path.lower().startswith("readme"):
             return path
@@ -109,7 +102,7 @@ def _find_readme_path(tree: list[str]) -> str | None:
 def _dependencies_pinned_ratio(manifest_path: str, content: str) -> float | None:
     """Rough heuristic, format-aware enough to not misjudge pyproject.toml/package.json
     (which pin very differently than requirements.txt) as unpinned."""
-    if manifest_path.endswith((".txt",)):  # requirements.txt-style
+    if manifest_path.endswith(".txt"):  # requirements.txt-style
         lines = [
             l.strip() for l in content.splitlines()
             if l.strip() and not l.strip().startswith("#") and not l.strip().startswith("-")
@@ -126,21 +119,25 @@ def _dependencies_pinned_ratio(manifest_path: str, content: str) -> float | None
         deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
         if not deps:
             return None
-        # npm convention: an exact version (no leading ^ or ~) is a hard pin.
         pinned = sum(1 for v in deps.values() if isinstance(v, str) and not v.startswith(("^", "~", ">", "*")))
         return pinned / len(deps)
     # pyproject.toml / Pipfile / environment.yml / Cargo.toml / go.mod: presence
-    # of the file itself already implies a resolvable, checked-in dependency
-    # spec (often with a companion lockfile) -- don't penalize format
-    # differences we're not parsing in detail.
+    # of the file itself already implies a resolvable dependency spec -- don't
+    # penalize format differences we're not parsing in detail.
     return None
 
 
-def _run_static_checks(metadata: dict, tree: list[str], owner: str, repo: str, branch: str) -> list[CheckResult]:
+def run_checks(tree: list[str], get_content: GetContent, metadata: dict | None = None) -> list[CheckResult]:
+    """Pure, source-agnostic. `tree` is every file path in the codebase;
+    `get_content(path)` lazily returns a file's text (or None if unavailable);
+    `metadata` is optional repo-level info (license/archived status) --
+    generated code has none of that, so those checks come back 'na' rather
+    than 'fail' when metadata is absent."""
+    metadata = metadata or {}
     checks: list[CheckResult] = []
 
-    readme_path = _find_readme_path(tree)
-    readme_content = repo_fetch.fetch_file_content(owner, repo, branch, readme_path) if readme_path else None
+    readme_path = find_readme_path(tree)
+    readme_content = get_content(readme_path) if readme_path else None
 
     checks.append(CheckResult(
         "has_readme", "Has a README",
@@ -151,29 +148,28 @@ def _run_static_checks(metadata: dict, tree: list[str], owner: str, repo: str, b
 
     has_license_file = any(p.upper().startswith("LICENSE") and "/" not in p for p in tree)
     has_license = bool(metadata.get("license_spdx_id")) or has_license_file
-    checks.append(CheckResult(
-        "has_license", "Has a license",
-        "pass" if has_license else "fail",
-        metadata.get("license_name") or ("LICENSE file present" if has_license_file else "No license detected."),
-        _CHECK_WEIGHTS["has_license"],
-    ))
+    if not metadata and not has_license_file:
+        license_status, license_detail = "na", "No repo metadata available and no LICENSE file to check."
+    else:
+        license_status = "pass" if has_license else "fail"
+        license_detail = metadata.get("license_name") or ("LICENSE file present" if has_license_file else "No license detected.")
+    checks.append(CheckResult("has_license", "Has a license", license_status, license_detail, _CHECK_WEIGHTS["has_license"]))
 
     spdx = (metadata.get("license_spdx_id") or "").lower()
     if not has_license:
-        recognized_status = "na"
-        recognized_detail = "No license to evaluate."
+        recognized_status, recognized_detail = "na", "No license to evaluate."
     elif spdx in RECOGNIZED_LICENSES:
-        recognized_status = "pass"
-        recognized_detail = f"'{spdx}' is a widely recognized OSI-style license."
+        recognized_status, recognized_detail = "pass", f"'{spdx}' is a widely recognized OSI-style license."
+    elif spdx:
+        recognized_status, recognized_detail = "warn", f"License present but not auto-recognized ('{spdx}') -- check terms manually."
     else:
-        recognized_status = "warn"
-        recognized_detail = f"License present but not auto-recognized ('{spdx or 'unspecified'}') -- check terms manually."
+        recognized_status, recognized_detail = "na", "License present but its identifier isn't known (e.g. no repo metadata)."
     checks.append(CheckResult(
         "license_is_recognized", "License is a recognized open license",
         recognized_status, recognized_detail, _CHECK_WEIGHTS["license_is_recognized"],
     ))
 
-    manifest_path = _find_manifest_path(tree)
+    manifest_path = find_manifest_path(tree)
     checks.append(CheckResult(
         "has_dependency_manifest", "Has a dependency manifest",
         "pass" if manifest_path else "fail",
@@ -182,7 +178,7 @@ def _run_static_checks(metadata: dict, tree: list[str], owner: str, repo: str, b
     ))
 
     if manifest_path:
-        manifest_content = repo_fetch.fetch_file_content(owner, repo, branch, manifest_path)
+        manifest_content = get_content(manifest_path)
         ratio = _dependencies_pinned_ratio(manifest_path, manifest_content) if manifest_content else None
         if ratio is None:
             status, detail = "na", "Pinning not evaluated for this manifest format (presence alone counted above)."
@@ -194,10 +190,7 @@ def _run_static_checks(metadata: dict, tree: list[str], owner: str, repo: str, b
             status, detail = "fail", f"{ratio:.0%} of dependencies are version-pinned -- reproducibility risk."
     else:
         status, detail = "na", "No manifest found to check."
-    checks.append(CheckResult(
-        "dependencies_pinned", "Dependencies are version-pinned",
-        status, detail, _CHECK_WEIGHTS["dependencies_pinned"],
-    ))
+    checks.append(CheckResult("dependencies_pinned", "Dependencies are version-pinned", status, detail, _CHECK_WEIGHTS["dependencies_pinned"]))
 
     has_tests = any(
         "test" in seg.lower()
@@ -230,26 +223,24 @@ def _run_static_checks(metadata: dict, tree: list[str], owner: str, repo: str, b
 
     if readme_content:
         lowered = readme_content.lower()
-        has_code_block = "```" in readme_content
-        has_usage_words = any(kw in lowered for kw in ("install", "usage", "getting started", "quickstart", "how to run"))
-        usage_ok = has_code_block or has_usage_words
-        detail = "README includes install/usage instructions." if usage_ok else "README doesn't appear to describe how to install or run the code."
+        usage_ok = "```" in readme_content or any(kw in lowered for kw in ("install", "usage", "getting started", "quickstart", "how to run"))
         status = "pass" if usage_ok else "warn"
+        detail = "README includes install/usage instructions." if usage_ok else "README doesn't appear to describe how to install or run the code."
     elif readme_path:
         status, detail = "na", "README found but couldn't be fetched to inspect."
     else:
         status, detail = "fail", "No README to check."
-    checks.append(CheckResult(
-        "readme_has_usage_instructions", "README explains install/usage",
-        status, detail, _CHECK_WEIGHTS["readme_has_usage_instructions"],
-    ))
+    checks.append(CheckResult("readme_has_usage_instructions", "README explains install/usage", status, detail, _CHECK_WEIGHTS["readme_has_usage_instructions"]))
 
-    checks.append(CheckResult(
-        "repo_not_archived", "Repository is actively maintained (not archived)",
-        "fail" if metadata.get("archived") else "pass",
-        "Repository is archived on GitHub." if metadata.get("archived") else "Repository is not archived.",
-        _CHECK_WEIGHTS["repo_not_archived"],
-    ))
+    if "archived" in metadata:
+        checks.append(CheckResult(
+            "repo_not_archived", "Repository is actively maintained (not archived)",
+            "fail" if metadata.get("archived") else "pass",
+            "Repository is archived on GitHub." if metadata.get("archived") else "Repository is not archived.",
+            _CHECK_WEIGHTS["repo_not_archived"],
+        ))
+    else:
+        checks.append(CheckResult("repo_not_archived", "Repository is actively maintained (not archived)", "na", "Not applicable (no repo metadata).", _CHECK_WEIGHTS["repo_not_archived"]))
 
     has_citation = any(p.upper() in ("CITATION.CFF", "CITATION.BIB", "CITATION") for p in tree)
     checks.append(CheckResult(
@@ -262,32 +253,30 @@ def _run_static_checks(metadata: dict, tree: list[str], owner: str, repo: str, b
     return checks
 
 
-def _score(checks: list[CheckResult]) -> tuple[int, str]:
+def score(checks: list[CheckResult]) -> tuple[int, str]:
     applicable = [c for c in checks if c.status != "na"]
     total_weight = sum(c.weight for c in applicable) or 1
-    earned = sum(c.weight for c in applicable if c.status == "pass") + sum(
-        c.weight * 0.5 for c in applicable if c.status == "warn"
-    )
-    score = round(100 * earned / total_weight)
-    if score >= 80:
+    earned = sum(c.weight for c in applicable if c.status == "pass") + sum(c.weight * 0.5 for c in applicable if c.status == "warn")
+    pct = round(100 * earned / total_weight)
+    if pct >= 80:
         verdict = "Likely reproducible"
-    elif score >= 50:
+    elif pct >= 50:
         verdict = "Partially reproducible -- some gaps"
     else:
         verdict = "Reproducibility at risk"
-    return score, verdict
+    return pct, verdict
 
 
-def _method_excerpt(paper: IngestedPaper) -> str:
+def method_excerpt(paper: IngestedPaper) -> str:
     chunks = [s.text for s in paper.sections if s.heading.lower() in METHOD_HEADINGS]
     text = "\n\n".join(chunks) or paper.abstract
     return text[:5000]
 
 
 def verify_claims(paper: IngestedPaper, tree: list[str], readme_content: str | None) -> list[dict]:
-    """One bounded LLM call: does the repo's structure/README plausibly back
-    up what the paper's Methods section claims to have implemented?"""
-    method_text = _method_excerpt(paper)
+    """One bounded LLM call: does the codebase's structure/README plausibly
+    back up what the paper's Methods section claims was implemented?"""
+    method_text = method_excerpt(paper)
     if not method_text.strip():
         return []
 
@@ -297,10 +286,10 @@ def verify_claims(paper: IngestedPaper, tree: list[str], readme_content: str | N
     prompt = f"""PAPER METHOD/APPROACH EXCERPT:
 {method_text}
 
-REPO FILE LISTING:
+CODEBASE FILE LISTING:
 {tree_summary}
 
-REPO README (excerpt):
+CODEBASE README (excerpt):
 {readme_excerpt}
 
 Identify up to 5 concrete implementation claims from the paper excerpt (e.g. "uses a
@@ -330,53 +319,18 @@ Respond with ONLY a JSON object of this exact shape, no other text:
     return results
 
 
-def analyze(paper: IngestedPaper, repo_url: str | None = None) -> dict:
-    """Main entry point. `repo_url` overrides whatever URL (if any) is found
-    in the paper's own text -- lets a user point at the right repo when a
-    paper doesn't link one, or links the wrong one (e.g. a baseline's repo)."""
-    url = repo_url or repo_fetch.extract_code_url(paper.full_text)
-    if not url:
-        report = ReproReport(
-            repo_url=None, repo_metadata=None,
-            note="No GitHub repository URL was found in the paper, and none was supplied. "
-                 "Pass a repo_url to check a specific repository.",
-        )
-        return _report_to_dict(report)
-
-    try:
-        owner, repo = repo_fetch.parse_github_url(url)
-        metadata = repo_fetch.fetch_repo_metadata(owner, repo)
-        branch = metadata["default_branch"]
-        tree = repo_fetch.fetch_file_tree(owner, repo, branch)
-    except RepoFetchError as e:
-        logger.warning("repro_fetch_failed url=%s error=%s", url, e)
-        report = ReproReport(repo_url=url, repo_metadata=None, note=str(e))
-        return _report_to_dict(report)
-
-    checks = _run_static_checks(metadata, tree, owner, repo, branch)
-    score, verdict = _score(checks)
-
-    readme_path = _find_readme_path(tree)
-    readme_content = repo_fetch.fetch_file_content(owner, repo, branch, readme_path) if readme_path else None
+def evaluate(paper: IngestedPaper, tree: list[str], get_content: GetContent, metadata: dict | None = None) -> dict:
+    """Run static checks + (optionally) claim verification against any
+    codebase, and package it into the shared report shape used by both
+    the repo-checker and the generator's self-check."""
+    checks = run_checks(tree, get_content, metadata)
+    pct, verdict = score(checks)
+    readme_path = find_readme_path(tree)
+    readme_content = get_content(readme_path) if readme_path else None
     claims = verify_claims(paper, tree, readme_content) if config.REPRO_LLM_CLAIMS_ENABLED else []
-
-    report = ReproReport(
-        repo_url=metadata["html_url"], repo_metadata=metadata,
-        checks=checks, score=score, verdict=verdict, claims=claims,
-    )
-    return _report_to_dict(report)
-
-
-def _report_to_dict(report: ReproReport) -> dict:
     return {
-        "repo_url": report.repo_url,
-        "repo_metadata": report.repo_metadata,
-        "checks": [
-            {"id": c.id, "label": c.label, "status": c.status, "detail": c.detail, "weight": c.weight}
-            for c in report.checks
-        ],
-        "score": report.score,
-        "verdict": report.verdict,
-        "claims": report.claims,
-        "note": report.note,
+        "checks": [{"id": c.id, "label": c.label, "status": c.status, "detail": c.detail, "weight": c.weight} for c in checks],
+        "score": pct,
+        "verdict": verdict,
+        "claims": claims,
     }
