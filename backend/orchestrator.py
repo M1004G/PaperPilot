@@ -5,9 +5,10 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from backend import ingestion_agent, summary_agent, gap_agent, rag_agent, report_agent, persistence
+from backend import ingestion_agent, summary_agent, gap_agent, rag_agent, report_agent, repro_check_agent, codegen_agent, repo_fetch, persistence
 from backend.ingestion_agent import IngestedPaper
 from backend.rag_agent import RAGIndex
+from backend.repo_fetch import RepoFetchError
 
 logger = logging.getLogger("paperpilot.orchestrator")
 
@@ -23,6 +24,8 @@ class DocSession:
     _section_summaries: list = None
     _key_findings: list = None
     _gaps: dict = None
+    _repro: dict = None
+    _repro_url_used: str = None  # the repo_url the cached _repro result was computed for
 
 
 class Orchestrator:
@@ -56,6 +59,8 @@ class Orchestrator:
                     _section_summaries=row["section_summaries"],
                     _key_findings=row["key_findings"],
                     _gaps=row["gaps"],
+                    _repro=row["repro"],
+                    _repro_url_used=row["repro_url_used"],
                 )
                 self.sessions[row["doc_id"]] = session
             except Exception as e:
@@ -143,17 +148,97 @@ class Orchestrator:
             logger.info("cache_hit doc_id=%s field=gaps", doc_id)
         return session._gaps
 
+    # ---------- reproducibility ----------
+    def get_reproducibility(self, doc_id: str, repo_url: str | None = None) -> dict:
+        """Two sources feed the same evaluation, per-doc cached (cache key
+        includes repo_url so overriding it forces a fresh run):
+        - a real repo is linked/supplied -> fetch it and evaluate it
+        - no repo -> generate an implementation attempt, then evaluate THAT
+          with the exact same checks, so "trustworthy" means the same thing
+          either way instead of two disconnected notions of reproducibility.
+        """
+        session = self._get_session(doc_id)
+        cache_valid = session._repro is not None and session._repro_url_used == repo_url
+        if not cache_valid:
+            logger.info("cache_miss doc_id=%s field=repro repo_url=%s", doc_id, repo_url)
+            t0 = time.monotonic()
+            session._repro = self._run_reproducibility(session.paper, repo_url)
+            session._repro_url_used = repo_url
+            logger.info("stage_timing doc_id=%s stage=repro elapsed=%.2fs", doc_id, time.monotonic() - t0)
+            persistence.update_repro_cache(doc_id, session._repro, repo_url)
+        else:
+            logger.info("cache_hit doc_id=%s field=repro", doc_id)
+        return session._repro
+
+    def get_cached_reproducibility(self, doc_id: str) -> dict | None:
+        """Whatever reproducibility result (if any) is already cached for this
+        doc, regardless of which repo_url produced it. Used by the download
+        endpoint so it serves exactly what the person already saw in the UI --
+        it must NOT trigger a fresh run, since re-running with a default
+        repo_url=None could silently switch modes (e.g. from a specific repo
+        check back to code generation) and hand back files that don't match
+        what was actually displayed."""
+        session = self._get_session(doc_id)
+        return session._repro
+
+
+    def _run_reproducibility(self, paper: IngestedPaper, repo_url: str | None) -> dict:
+        url = repo_url or repo_fetch.extract_code_url(paper.full_text)
+
+        if url:
+            try:
+                owner, repo = repo_fetch.parse_github_url(url)
+                metadata = repo_fetch.fetch_repo_metadata(owner, repo)
+                branch = metadata["default_branch"]
+                tree = repo_fetch.fetch_file_tree(owner, repo, branch)
+            except RepoFetchError as e:
+                logger.warning("repro_fetch_failed url=%s error=%s", url, e)
+                return {
+                    "mode": "repo_check", "repo_url": url, "repo_metadata": None,
+                    "checks": [], "score": None, "verdict": None, "claims": [],
+                    "paper_info": None, "files": {}, "gap_report": None, "note": str(e),
+                }
+            get_content = lambda path: repo_fetch.fetch_file_content(owner, repo, branch, path)
+            evaluation = repro_check_agent.evaluate(paper, tree, get_content, metadata)
+            return {
+                "mode": "repo_check", "repo_url": metadata["html_url"], "repo_metadata": metadata,
+                "paper_info": None, "files": {}, "gap_report": None, "note": None,
+                **evaluation,
+            }
+
+        # No repo found or supplied -- generate an implementation and self-check it.
+        generated = codegen_agent.analyze(paper)
+        files = generated["files"]
+        if not files:
+            return {
+                "mode": "generated", "repo_url": None, "repo_metadata": None,
+                "paper_info": generated["paper_info"], "files": {}, "gap_report": generated["gap_report"],
+                "checks": [], "score": None, "verdict": None, "claims": [],
+                "note": "No repository was found or supplied, and code generation did not produce any files "
+                        "(check GROQ_API_KEY / CODEGEN_ENABLED / logs for the underlying error).",
+            }
+        tree = sorted(files.keys())
+        evaluation = repro_check_agent.evaluate(paper, tree, files.get, metadata=None)
+        return {
+            "mode": "generated", "repo_url": None, "repo_metadata": None,
+            "paper_info": generated["paper_info"], "files": files, "gap_report": generated["gap_report"],
+            "note": None,
+            **evaluation,
+        }
+
     # ---------- report ----------
     def get_report(self, doc_id: str) -> str:
         session = self._get_session(doc_id)
         summary = self.get_summary(doc_id)
         gaps = self.get_gaps(doc_id)
+        repro = self.get_reproducibility(doc_id)
         return report_agent.build_report(
             paper=session.paper,
             tldr=summary["tldr"],
             section_summaries=summary["section_summaries"],
             key_findings=summary["key_findings"],
             gaps=gaps,
+            repro=repro,
         )
 
     # ---------- chat / RAG ----------

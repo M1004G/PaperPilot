@@ -84,6 +84,172 @@ class TestFullFlow:
         assert report_resp.status_code == 200
 
 
+class TestReproducibilityEndpoint:
+    def test_no_repo_triggers_code_generation(self, client, tmp_path, fake_llm, monkeypatch):
+        path = make_test_pdf(tmp_path, {
+            "Abstract": "This paper studies something with no code link.",
+            "Methodology": "We use a transformer encoder trained with Adam.",
+        })
+        with open(path, "rb") as f:
+            upload_resp = client.post("/upload", files={"file": ("paper.pdf", f, "application/pdf")})
+        doc_id = upload_resp.json()["doc_id"]
+
+        from backend import codegen_agent
+        monkeypatch.setattr(codegen_agent, "analyze", lambda paper: {
+            "paper_info": {"title": "T", "gaps": ["LR not specified"]},
+            "files": {"model.py": "import torch", "README.md": "# Generated"},
+            "gap_report": "## Extraction Gaps\n- LR not specified",
+        })
+
+        r = client.get(f"/reproducibility/{doc_id}")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["mode"] == "generated"
+        assert data["files"] == {"model.py": "import torch", "README.md": "# Generated"}
+        assert data["paper_info"]["gaps"] == ["LR not specified"]
+        assert isinstance(data["score"], int)
+
+    def test_explicit_repo_url_query_param_triggers_repo_check(self, client, tmp_path, monkeypatch):
+        path = make_test_pdf(tmp_path, {"Abstract": "This paper studies something interesting."})
+        with open(path, "rb") as f:
+            upload_resp = client.post("/upload", files={"file": ("paper.pdf", f, "application/pdf")})
+        doc_id = upload_resp.json()["doc_id"]
+
+        from backend import repo_fetch, repro_check_agent
+        monkeypatch.setattr(repo_fetch, "fetch_repo_metadata", lambda o, r: {
+            "full_name": "foo/bar", "default_branch": "main", "archived": False,
+            "license_spdx_id": "mit", "license_name": "MIT", "html_url": "https://github.com/foo/bar",
+            "stargazers_count": 1, "pushed_at": "2026-01-01",
+        })
+        monkeypatch.setattr(repo_fetch, "fetch_file_tree", lambda *a, **k: ["README.md"])
+        monkeypatch.setattr(repo_fetch, "fetch_file_content", lambda *a, **k: "# Bar")
+        monkeypatch.setattr(repro_check_agent, "verify_claims", lambda *a, **k: [])
+
+        r = client.get(f"/reproducibility/{doc_id}", params={"repo_url": "https://github.com/foo/bar"})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["mode"] == "repo_check"
+        assert data["repo_url"] == "https://github.com/foo/bar"
+        assert data["files"] == {}
+
+    def test_unknown_doc_id_returns_404(self, client):
+        r = client.get("/reproducibility/does-not-exist")
+        assert r.status_code == 404
+
+    def test_report_includes_reproducibility_section(self, client, tmp_path, fake_llm):
+        path = make_test_pdf(tmp_path, {
+            "Abstract": "This paper studies something interesting.",
+            "Methodology": "We use a novel transformer-based approach.",
+        })
+        with open(path, "rb") as f:
+            upload_resp = client.post("/upload", files={"file": ("paper.pdf", f, "application/pdf")})
+        doc_id = upload_resp.json()["doc_id"]
+
+        r = client.get(f"/report/{doc_id}")
+        assert r.status_code == 200
+        assert "## Code Reproducibility" in r.text
+
+
+class TestReproducibilityDownload:
+    def test_returns_zip_for_generated_mode(self, client, tmp_path, fake_llm, monkeypatch):
+        path = make_test_pdf(tmp_path, {"Abstract": "Abstract.", "Methodology": "We use Adam."})
+        with open(path, "rb") as f:
+            upload_resp = client.post("/upload", files={"file": ("paper.pdf", f, "application/pdf")})
+        doc_id = upload_resp.json()["doc_id"]
+
+        from backend import codegen_agent
+        monkeypatch.setattr(codegen_agent, "analyze", lambda paper: {
+            "paper_info": {"title": "T", "gaps": []},
+            "files": {"model.py": "import torch"},
+            "gap_report": "## Extraction Gaps\n_No gaps identified._",
+        })
+
+        # Download reuses whatever GET /reproducibility already computed --
+        # it must be called first to populate the cache.
+        assert client.get(f"/reproducibility/{doc_id}").json()["mode"] == "generated"
+
+        r = client.get(f"/reproducibility/{doc_id}/download")
+        assert r.status_code == 200
+        assert r.headers["content-type"] == "application/zip"
+
+        import io, zipfile
+        zf = zipfile.ZipFile(io.BytesIO(r.content))
+        assert zf.namelist() == ["model.py"]
+        assert zf.read("model.py").decode() == "import torch"
+
+    def test_404_when_nothing_computed_yet(self, client, tmp_path):
+        path = make_test_pdf(tmp_path, {"Abstract": "Abstract."})
+        with open(path, "rb") as f:
+            upload_resp = client.post("/upload", files={"file": ("paper.pdf", f, "application/pdf")})
+        doc_id = upload_resp.json()["doc_id"]
+        r = client.get(f"/reproducibility/{doc_id}/download")
+        assert r.status_code == 404
+
+    def test_unsafe_filenames_from_cached_data_are_dropped_not_written(self, client, tmp_path, fake_llm, monkeypatch):
+        """Defense in depth: even if a filename in cached/persisted repro data
+        were somehow unsafe (bypassing plan_files()'s own sanitization --
+        e.g. an older cache entry from before this guard existed), the
+        download route must not write it into the zip."""
+        path = make_test_pdf(tmp_path, {"Abstract": "Abstract.", "Methodology": "We use Adam."})
+        with open(path, "rb") as f:
+            upload_resp = client.post("/upload", files={"file": ("paper.pdf", f, "application/pdf")})
+        doc_id = upload_resp.json()["doc_id"]
+
+        from backend import codegen_agent
+        monkeypatch.setattr(codegen_agent, "analyze", lambda paper: {
+            "paper_info": {"title": "T", "gaps": []},
+            "files": {"model.py": "import torch", "../../etc/passwd": "malicious"},
+            "gap_report": "## Extraction Gaps\n_No gaps identified._",
+        })
+        assert client.get(f"/reproducibility/{doc_id}").json()["mode"] == "generated"
+
+        r = client.get(f"/reproducibility/{doc_id}/download")
+        assert r.status_code == 200
+
+        import io, zipfile
+        zf = zipfile.ZipFile(io.BytesIO(r.content))
+        assert zf.namelist() == ["model.py"]  # the unsafe entry never made it into the zip
+
+    def test_404_when_only_unsafe_filenames_present(self, client, tmp_path, fake_llm, monkeypatch):
+        path = make_test_pdf(tmp_path, {"Abstract": "Abstract.", "Methodology": "We use Adam."})
+        with open(path, "rb") as f:
+            upload_resp = client.post("/upload", files={"file": ("paper.pdf", f, "application/pdf")})
+        doc_id = upload_resp.json()["doc_id"]
+
+        from backend import codegen_agent
+        monkeypatch.setattr(codegen_agent, "analyze", lambda paper: {
+            "paper_info": {"title": "T", "gaps": []},
+            "files": {"../../etc/passwd": "malicious"},
+            "gap_report": "## Extraction Gaps\n_No gaps identified._",
+        })
+        assert client.get(f"/reproducibility/{doc_id}").json()["mode"] == "generated"
+
+        r = client.get(f"/reproducibility/{doc_id}/download")
+        assert r.status_code == 404
+
+    def test_404_when_repo_check_mode(self, client, tmp_path, monkeypatch):
+        path = make_test_pdf(tmp_path, {"Abstract": "Abstract."})
+        with open(path, "rb") as f:
+            upload_resp = client.post("/upload", files={"file": ("paper.pdf", f, "application/pdf")})
+        doc_id = upload_resp.json()["doc_id"]
+
+        from backend import repo_fetch, repro_check_agent
+        monkeypatch.setattr(repo_fetch, "fetch_repo_metadata", lambda o, r: {
+            "full_name": "foo/bar", "default_branch": "main", "archived": False,
+            "license_spdx_id": None, "license_name": None, "html_url": "https://github.com/foo/bar",
+            "stargazers_count": 0, "pushed_at": None,
+        })
+        monkeypatch.setattr(repo_fetch, "fetch_file_tree", lambda *a, **k: [])
+        monkeypatch.setattr(repo_fetch, "fetch_file_content", lambda *a, **k: None)
+        monkeypatch.setattr(repro_check_agent, "verify_claims", lambda *a, **k: [])
+
+        r = client.get(f"/reproducibility/{doc_id}", params={"repo_url": "https://github.com/foo/bar"})
+        assert r.json()["mode"] == "repo_check"
+
+        r2 = client.get(f"/reproducibility/{doc_id}/download")
+        assert r2.status_code == 404
+
+
 class TestErrorMapping:
     def test_unknown_doc_id_returns_404(self, client):
         r = client.get("/summary/does-not-exist")

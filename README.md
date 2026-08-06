@@ -5,6 +5,7 @@ Multi-agent system that ingests a research paper (PDF) and produces:
 - A structured report (Markdown)
 - A research-gap analysis (author-acknowledged vs. critically inferred)
 - A RAG-based chatbot grounded in the paper, with section+page citations
+- A code-reproducibility check against the paper's linked GitHub repo (repo hygiene + a lightweight paper-vs-code claim check)
 
 See `ARCHITECTURE.md` for the full design.
 
@@ -98,6 +99,9 @@ backend/
   ingestion_agent.py     # PDF -> text, sections, per-page metadata; validates corrupt/encrypted/empty files
   summary_agent.py       # TL;DR + section summaries (parallelized, capped concurrency, per-section error isolation)
   gap_agent.py           # research gap analysis (structured JSON output, not string parsing)
+  repo_fetch.py          # safe, read-only GitHub access (metadata, file tree, file contents) -- no clone, no code execution
+  repro_check_agent.py   # source-agnostic code-quality checks + LLM claim verification (works on a real repo OR generated code)
+  codegen_agent.py       # when no repo exists: extracts structured methodology info, generates an implementation attempt
   rag_agent.py           # sentence-aware chunking, section+page metadata, cross-encoder reranking, chat
   report_agent.py        # assembles final Markdown report (no LLM call — deterministic)
   persistence.py         # SQLite-backed session storage, survives server restarts
@@ -128,6 +132,17 @@ Every request is logged (method, path, status, timing) via middleware in `main.p
 
 ## Notes / extension points
 - `config.py` centralizes the model name (`llama-3.3-70b-versatile` on Groq by default) — change it in one place.
+
+## Reproducibility Suite
+Answers "can I trust/reuse code for this paper?" — via `GET /reproducibility/{doc_id}` (optionally `?repo_url=...`). Two sources feed the **same** evaluation, so trust means the same thing either way (response includes a `mode` field):
+
+- **`mode: "repo_check"`** — a repo is linked in the paper (or supplied via `repo_url`). Fetched read-only through GitHub's REST API only (`api.github.com` / `raw.githubusercontent.com`) — no `git clone`, no code from the target repo is ever executed. Set `GITHUB_TOKEN` in `.env` to raise the rate limit from 60/hr to 5000/hr.
+- **`mode: "generated"`** — no repo is linked (the common case). `codegen_agent.py` extracts structured methodology info (datasets/model/training config, with explicit `gaps` for anything unspecified), plans a small file set + dependencies, then generates each file in dependency order (`model.py`, `dataset.py`, `train.py`, `requirements.txt`, `README.md`). Each `.py` file is validated with `compile(..., "exec")` before being accepted — a syntax error triggers one retry with the actual error shown to the model; refusal-shaped or suspiciously short output is rejected outright, no retry. Filenames are sanitized against path traversal/absolute paths (flat single-directory only) both when the plan is built and again, independently, in the download route. None of this executes the generated code — it's a syntax/shape check, not a correctness one. Download as a zip via `GET /reproducibility/{doc_id}/download`. Toggle off with `CODEGEN_ENABLED=false`.
+
+Either way, `repro_check_agent.py` runs the same two layers against whatever codebase it's given:
+- **Static checks (weighted, no LLM)** — README, license, dependency manifest + pinning ratio, tests, CI, Dockerfile/env spec, usage instructions, archived status, CITATION file. Weighted to a 0-100 score; code-hygiene items are weighted heavier than documentation extras. Checks that need repo metadata (license identifier, archived status) come back `na` rather than `fail` for generated code, which has no such metadata.
+- **Claim verification (one bounded LLM call, optional)** — does the codebase plausibly implement what the paper's Methods section claims? Toggle off with `REPRO_LLM_CLAIMS_ENABLED=false`.
+
 - Groq's free tier is rate-limited (not credit-metered) — `llm_client.py` retries on 429s (configurable timeout via `LLM_TIMEOUT_SECONDS`), and section summarization runs on a capped thread pool so it doesn't burst past the requests-per-minute limit. One section failing doesn't discard the others' results.
 - Every request gets a request ID (returned as an `X-Request-ID` header and threaded through every log line, including inside the section-summary thread pool via `contextvars`) — grep any log by request ID to see everything that happened for one request. Per-stage timing (ingestion, index build, retrieval/rerank, per-Groq-call) and cache hit/miss are all logged.
 - The FAISS index itself isn't persisted — on restart, chunks are reloaded from SQLite and re-embedded locally (no Groq calls involved, so this is cheap and avoids FAISS version/serialization issues).
