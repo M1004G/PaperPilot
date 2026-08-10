@@ -76,10 +76,24 @@ def _reproducibility_section(repro: dict | None) -> list[str]:
         )
     lines.append(f"**Score:** {repro['score']}/100 — {repro['verdict']}")
     lines.append("")
-    lines.append("### Static Checks")
+
+    lines.append("### Category Scores")
+    cat_labels = {"documentation": "Documentation", "hygiene": "Project Hygiene", "code_quality": "Code Quality", "correctness": "Correctness"}
+    for cat_id, label in cat_labels.items():
+        val = (repro.get("category_scores") or {}).get(cat_id)
+        lines.append(f"- **{label}:** {val}/100" if val is not None else f"- **{label}:** N/A (no applicable checks)")
+    lines.append("")
+
+    lines.append("### Checks")
     for c in repro["checks"]:
         lines.append(f"- {_STATUS_ICON.get(c['status'], '•')} **{c['label']}** — {c['detail']}")
     lines.append("")
+
+    if repro.get("warnings"):
+        lines.append("### Warnings (informational, not scored)")
+        for w in repro["warnings"]:
+            lines.append(f"- ⚠️ **{w['label']}** — {w['detail']}")
+        lines.append("")
 
     lines.append("### Claim Verification (paper vs. code)")
     if repro.get("claims"):
@@ -89,6 +103,14 @@ def _reproducibility_section(repro: dict | None) -> list[str]:
             lines.append(f"- {icon} **{item['claim']}** — {item['evidence']}")
     else:
         lines.append("_No implementation claims were checked (LLM claim verification disabled, or nothing extractable from the Methods section)._")
+
+    if repro.get("semantic_findings"):
+        lines.append("")
+        lines.append("### Semantic Review Findings (paper vs. generated code)")
+        severity_icon = {"high": "🔴", "medium": "🟡", "low": "⚪"}
+        for f in repro["semantic_findings"]:
+            icon = severity_icon.get(f["severity"], "•")
+            lines.append(f"- {icon} **[{f['location']}]** {f['issue']}")
 
     if repro.get("mode") == "generated":
         lines.append("")

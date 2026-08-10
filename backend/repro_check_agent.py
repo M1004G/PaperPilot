@@ -1,27 +1,44 @@
-"""Reproducibility Check Agent: source-agnostic code-quality checks + claim
-verification.
+"""Reproducibility Check Agent: source-agnostic code-quality checks + LLM
+review, organized into four scored categories (plus a separate, non-scored
+Warnings list) rather than one opaque number.
 
 Deliberately doesn't know or care where the code came from -- it operates on
 a plain (paths, get_content, metadata) triple. Two sources feed it:
 - repo_fetch.py (a real GitHub repo linked in the paper)
 - codegen_agent.py (code PaperPilot generated itself, when no repo exists)
 
-That's the point: the same "is this trustworthy/complete" checks apply
-whether the code is someone else's or ours, so trust is scored consistently
-either way instead of two disconnected notions of "reproducible."
+Categories:
+- documentation  -- README presence + usage instructions
+- hygiene        -- license, CI, dependency manifest, archived status
+                     (real repos only -- see the profile note below)
+- code_quality   -- ruff static analysis (generated code only)
+- correctness    -- tests, pinned dependencies, and (generated code only) an
+                     LLM semantic review comparing the code against the paper
 
-Two layers, kept separate (same split as gap_agent's author-acknowledged vs.
-inferred):
-1. STATIC CHECKS (primary, no LLM) -- mechanical facts about hygiene: README,
-   license, pinned dependencies, tests, CI, Dockerfile, etc.
-2. CLAIM VERIFICATION (secondary, one bounded LLM call) -- does the code
-   plausibly support what the paper's Methodology section *claims* was
-   implemented? Judgment, not a mechanical fact, so it's scoped to a single
-   rubric-style call treated as one input among several, not a verdict alone.
+Two profiles, not one weighting -- a real repo and code generated fresh in
+this session answer different questions:
+- profile="repo": full hygiene checklist scored; no code_quality or semantic
+  review (we don't fetch every source file's content from GitHub just to
+  lint it -- see repo_fetch.py's docstring on why that's a deliberate cost
+  tradeoff).
+- profile="generated": license/CI/archived-status checks are dropped
+  entirely (not run, not shown as N/A clutter) -- code generated fresh in
+  one session was never going to have a LICENSE file or CI, and scoring it
+  down for that conflates repo-maintenance hygiene with implementation
+  quality. In their place: ruff (code_quality) and an LLM semantic review
+  (correctness) -- the closest available correctness-adjacent signals
+  without executing anything.
+
+Checks that are informational rather than a real pass/fail signal (missing
+Dockerfile, missing CITATION file) are collected separately as `warnings`
+and excluded from scoring entirely, rather than silently shaping the number.
 """
 import json
 import logging
-from dataclasses import dataclass, field
+import os
+import subprocess
+import tempfile
+from dataclasses import dataclass
 from typing import Callable
 
 from backend import config, llm_client
@@ -37,25 +54,64 @@ CLAIM_SYSTEM_PROMPT = (
     "listing or README/excerpt gives concrete evidence for it."
 )
 
+SEMANTIC_REVIEW_SYSTEM_PROMPT = (
+    "You are a rigorous ML code reviewer comparing a generated implementation against "
+    "the paper's described method. You look for missing algorithmic steps, calls to "
+    "APIs/functions that don't plausibly exist, likely tensor/array shape mismatches, "
+    "and other correctness concerns -- not style or formatting. You are specific, cite "
+    "the file where an issue occurs, and never invent a problem that isn't evident from "
+    "the code actually shown to you."
+)
+
 METHOD_HEADINGS = {
     "method", "methods", "methodology", "approach", "model", "architecture",
     "experimental setup", "experiments", "implementation",
 }
 
-# Weights sum to 100 so the aggregate score is already a percentage. Code-hygiene
-# items (pinning, tests, CI, manifest) are weighted heavier than doc extras.
-_CHECK_WEIGHTS = {
+CATEGORIES = ("documentation", "hygiene", "code_quality", "correctness")
+
+# Category each check belongs to. "warning" is not a scored category --
+# checks with this category are informational only (see evaluate()).
+_CHECK_CATEGORY = {
+    "has_readme": "documentation",
+    "readme_has_usage_instructions": "documentation",
+    "has_license": "hygiene",
+    "license_is_recognized": "hygiene",
+    "has_dependency_manifest": "hygiene",
+    "has_ci": "hygiene",
+    "repo_not_archived": "hygiene",
+    "dependencies_pinned": "correctness",
+    "has_tests": "correctness",
+    "static_analysis_clean": "code_quality",
+    "semantic_review": "correctness",
+    "has_dockerfile_or_env_spec": "warning",
+    "has_citation_file": "warning",
+}
+
+# Weights sum to 100 within each profile's *scored* checks (warning-category
+# checks aren't weighted -- their weight is irrelevant to scoring).
+_REPO_CHECK_WEIGHTS = {
     "has_readme": 10,
-    "has_license": 10,
+    "readme_has_usage_instructions": 10,
+    "has_license": 15,
+    "license_is_recognized": 5,
     "has_dependency_manifest": 15,
+    "has_ci": 10,
+    "repo_not_archived": 5,
     "dependencies_pinned": 15,
     "has_tests": 15,
-    "has_ci": 10,
+    "has_dockerfile_or_env_spec": 0,
+    "has_citation_file": 0,
+}
+_GENERATED_WEIGHTS = {
+    "has_readme": 10,
     "readme_has_usage_instructions": 10,
-    "license_is_recognized": 5,
-    "repo_not_archived": 10,
-    "has_dockerfile_or_env_spec": 5,
-    "has_citation_file": 5,
+    "has_dependency_manifest": 15,
+    "static_analysis_clean": 25,
+    "dependencies_pinned": 10,
+    "has_tests": 10,
+    "semantic_review": 20,
+    "has_dockerfile_or_env_spec": 0,
 }
 
 DEPENDENCY_MANIFESTS = [
@@ -77,6 +133,7 @@ class CheckResult:
     status: str  # "pass" | "fail" | "warn" | "na"
     detail: str
     weight: int = 0
+    category: str = "correctness"
 
 
 def find_manifest_path(tree: list[str]) -> str | None:
@@ -102,7 +159,7 @@ def find_readme_path(tree: list[str]) -> str | None:
 def _dependencies_pinned_ratio(manifest_path: str, content: str) -> float | None:
     """Rough heuristic, format-aware enough to not misjudge pyproject.toml/package.json
     (which pin very differently than requirements.txt) as unpinned."""
-    if manifest_path.endswith(".txt"):  # requirements.txt-style
+    if manifest_path.endswith(".txt"):
         lines = [
             l.strip() for l in content.splitlines()
             if l.strip() and not l.strip().startswith("#") and not l.strip().startswith("-")
@@ -121,19 +178,82 @@ def _dependencies_pinned_ratio(manifest_path: str, content: str) -> float | None
             return None
         pinned = sum(1 for v in deps.values() if isinstance(v, str) and not v.startswith(("^", "~", ">", "*")))
         return pinned / len(deps)
-    # pyproject.toml / Pipfile / environment.yml / Cargo.toml / go.mod: presence
-    # of the file itself already implies a resolvable dependency spec -- don't
-    # penalize format differences we're not parsing in detail.
     return None
 
 
-def run_checks(tree: list[str], get_content: GetContent, metadata: dict | None = None) -> list[CheckResult]:
-    """Pure, source-agnostic. `tree` is every file path in the codebase;
-    `get_content(path)` lazily returns a file's text (or None if unavailable);
-    `metadata` is optional repo-level info (license/archived status) --
-    generated code has none of that, so those checks come back 'na' rather
-    than 'fail' when metadata is absent."""
+def _run_ruff_on_file(content: str, timeout: float) -> int | None:
+    """Lints one file's content with ruff (no execution). Returns the issue
+    count, or None if ruff genuinely couldn't be run (not installed, timed
+    out, errored) -- distinct from 'ran clean', never silently treated as
+    a failure."""
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as tf:
+            tf.write(content)
+            tmp_path = tf.name
+        # --isolated: ignore any ambient pyproject.toml/ruff.toml. --select=F:
+        # pyflakes only (undefined names, unused imports/vars, redefinitions)
+        # -- correctness-adjacent, NOT formatting/import-sort/line-length,
+        # which would tank the score on trivia unrelated to whether the code
+        # makes sense.
+        result = subprocess.run(
+            ["ruff", "check", "--isolated", "--select=F", "--output-format=json", "--quiet", tmp_path],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        logger.warning("ruff_unavailable_or_failed error=%s", e)
+        return None
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    try:
+        return len(json.loads(result.stdout)) if result.stdout.strip() else 0
+    except json.JSONDecodeError:
+        logger.warning("ruff_output_unparseable")
+        return None
+
+
+def _static_analysis_check(tree: list[str], get_content: GetContent, weight: int) -> CheckResult:
+    py_files = [p for p in tree if p.endswith(".py")]
+    if not py_files:
+        return CheckResult("static_analysis_clean", "Passes static analysis (ruff)", "na", "No Python files to analyze.", weight, "code_quality")
+
+    total_issues = 0
+    files_checked = 0
+    for path in py_files:
+        content = get_content(path)
+        if content is None:
+            continue
+        count = _run_ruff_on_file(content, config.REPRO_RUFF_TIMEOUT_SECONDS)
+        if count is None:
+            return CheckResult(
+                "static_analysis_clean", "Passes static analysis (ruff)", "na",
+                "ruff isn't available in this environment -- static analysis skipped.", weight, "code_quality",
+            )
+        total_issues += count
+        files_checked += 1
+
+    if files_checked == 0:
+        return CheckResult("static_analysis_clean", "Passes static analysis (ruff)", "na", "No Python file contents were available to analyze.", weight, "code_quality")
+    if total_issues == 0:
+        return CheckResult("static_analysis_clean", "Passes static analysis (ruff)", "pass", f"No issues found across {files_checked} Python file(s).", weight, "code_quality")
+    status = "warn" if total_issues <= 3 else "fail"
+    return CheckResult(
+        "static_analysis_clean", "Passes static analysis (ruff)", status,
+        f"{total_issues} issue(s) found across {files_checked} Python file(s) (undefined names, unused imports, likely bugs, etc.).",
+        weight, "code_quality",
+    )
+
+
+def run_checks(tree: list[str], get_content: GetContent, metadata: dict | None = None, profile: str = "repo") -> list[CheckResult]:
+    """Pure, source-agnostic static checks (no LLM). `profile` selects the
+    weighting AND which checks even apply -- see the module docstring."""
     metadata = metadata or {}
+    weights = _REPO_CHECK_WEIGHTS if profile == "repo" else _GENERATED_WEIGHTS
+    cat = _CHECK_CATEGORY
     checks: list[CheckResult] = []
 
     readme_path = find_readme_path(tree)
@@ -143,38 +263,39 @@ def run_checks(tree: list[str], get_content: GetContent, metadata: dict | None =
         "has_readme", "Has a README",
         "pass" if readme_path else "fail",
         f"Found `{readme_path}`" if readme_path else "No top-level README file found.",
-        _CHECK_WEIGHTS["has_readme"],
+        weights["has_readme"], cat["has_readme"],
     ))
 
-    has_license_file = any(p.upper().startswith("LICENSE") and "/" not in p for p in tree)
-    has_license = bool(metadata.get("license_spdx_id")) or has_license_file
-    if not metadata and not has_license_file:
-        license_status, license_detail = "na", "No repo metadata available and no LICENSE file to check."
-    else:
-        license_status = "pass" if has_license else "fail"
-        license_detail = metadata.get("license_name") or ("LICENSE file present" if has_license_file else "No license detected.")
-    checks.append(CheckResult("has_license", "Has a license", license_status, license_detail, _CHECK_WEIGHTS["has_license"]))
+    if profile == "repo":
+        has_license_file = any(p.upper().startswith("LICENSE") and "/" not in p for p in tree)
+        has_license = bool(metadata.get("license_spdx_id")) or has_license_file
+        if not metadata and not has_license_file:
+            license_status, license_detail = "na", "No repo metadata available and no LICENSE file to check."
+        else:
+            license_status = "pass" if has_license else "fail"
+            license_detail = metadata.get("license_name") or ("LICENSE file present" if has_license_file else "No license detected.")
+        checks.append(CheckResult("has_license", "Has a license", license_status, license_detail, weights["has_license"], cat["has_license"]))
 
-    spdx = (metadata.get("license_spdx_id") or "").lower()
-    if not has_license:
-        recognized_status, recognized_detail = "na", "No license to evaluate."
-    elif spdx in RECOGNIZED_LICENSES:
-        recognized_status, recognized_detail = "pass", f"'{spdx}' is a widely recognized OSI-style license."
-    elif spdx:
-        recognized_status, recognized_detail = "warn", f"License present but not auto-recognized ('{spdx}') -- check terms manually."
-    else:
-        recognized_status, recognized_detail = "na", "License present but its identifier isn't known (e.g. no repo metadata)."
-    checks.append(CheckResult(
-        "license_is_recognized", "License is a recognized open license",
-        recognized_status, recognized_detail, _CHECK_WEIGHTS["license_is_recognized"],
-    ))
+        spdx = (metadata.get("license_spdx_id") or "").lower()
+        if not has_license:
+            recognized_status, recognized_detail = "na", "No license to evaluate."
+        elif spdx in RECOGNIZED_LICENSES:
+            recognized_status, recognized_detail = "pass", f"'{spdx}' is a widely recognized OSI-style license."
+        elif spdx:
+            recognized_status, recognized_detail = "warn", f"License present but not auto-recognized ('{spdx}') -- check terms manually."
+        else:
+            recognized_status, recognized_detail = "na", "License present but its identifier isn't known (e.g. no repo metadata)."
+        checks.append(CheckResult(
+            "license_is_recognized", "License is a recognized open license",
+            recognized_status, recognized_detail, weights["license_is_recognized"], cat["license_is_recognized"],
+        ))
 
     manifest_path = find_manifest_path(tree)
     checks.append(CheckResult(
         "has_dependency_manifest", "Has a dependency manifest",
         "pass" if manifest_path else "fail",
         f"Found `{manifest_path}`" if manifest_path else "No requirements.txt/pyproject.toml/package.json/etc. found.",
-        _CHECK_WEIGHTS["has_dependency_manifest"],
+        weights["has_dependency_manifest"], cat["has_dependency_manifest"],
     ))
 
     if manifest_path:
@@ -190,7 +311,7 @@ def run_checks(tree: list[str], get_content: GetContent, metadata: dict | None =
             status, detail = "fail", f"{ratio:.0%} of dependencies are version-pinned -- reproducibility risk."
     else:
         status, detail = "na", "No manifest found to check."
-    checks.append(CheckResult("dependencies_pinned", "Dependencies are version-pinned", status, detail, _CHECK_WEIGHTS["dependencies_pinned"]))
+    checks.append(CheckResult("dependencies_pinned", "Dependencies are version-pinned", status, detail, weights["dependencies_pinned"], cat["dependencies_pinned"]))
 
     has_tests = any(
         "test" in seg.lower()
@@ -202,23 +323,24 @@ def run_checks(tree: list[str], get_content: GetContent, metadata: dict | None =
         "has_tests", "Has a test suite",
         "pass" if has_tests else "fail",
         "Found test files/directory." if has_tests else "No tests/ directory or test_*/*_test files found.",
-        _CHECK_WEIGHTS["has_tests"],
+        weights["has_tests"], cat["has_tests"],
     ))
 
-    has_ci = any(p.startswith((".github/workflows/", ".gitlab-ci")) for p in tree)
-    checks.append(CheckResult(
-        "has_ci", "Has continuous integration configured",
-        "pass" if has_ci else "fail",
-        "Found a CI workflow." if has_ci else "No .github/workflows or CI config found.",
-        _CHECK_WEIGHTS["has_ci"],
-    ))
+    if profile == "repo":
+        has_ci = any(p.startswith((".github/workflows/", ".gitlab-ci")) for p in tree)
+        checks.append(CheckResult(
+            "has_ci", "Has continuous integration configured",
+            "pass" if has_ci else "fail",
+            "Found a CI workflow." if has_ci else "No .github/workflows or CI config found.",
+            weights["has_ci"], cat["has_ci"],
+        ))
 
     has_docker_or_env = any(p.rsplit("/", 1)[-1] in ("Dockerfile", "environment.yml", "environment.yaml") for p in tree)
     checks.append(CheckResult(
         "has_dockerfile_or_env_spec", "Has a Dockerfile or environment spec",
         "pass" if has_docker_or_env else "warn",
-        "Found a Dockerfile/environment spec." if has_docker_or_env else "No containerized/conda environment spec found (not required, but helps reproducibility).",
-        _CHECK_WEIGHTS["has_dockerfile_or_env_spec"],
+        "Found a Dockerfile/environment spec." if has_docker_or_env else "No containerized/conda environment spec found (informational -- not scored).",
+        weights["has_dockerfile_or_env_spec"], cat["has_dockerfile_or_env_spec"],
     ))
 
     if readme_content:
@@ -230,31 +352,35 @@ def run_checks(tree: list[str], get_content: GetContent, metadata: dict | None =
         status, detail = "na", "README found but couldn't be fetched to inspect."
     else:
         status, detail = "fail", "No README to check."
-    checks.append(CheckResult("readme_has_usage_instructions", "README explains install/usage", status, detail, _CHECK_WEIGHTS["readme_has_usage_instructions"]))
+    checks.append(CheckResult("readme_has_usage_instructions", "README explains install/usage", status, detail, weights["readme_has_usage_instructions"], cat["readme_has_usage_instructions"]))
 
-    if "archived" in metadata:
+    if profile == "repo":
+        if "archived" in metadata:
+            checks.append(CheckResult(
+                "repo_not_archived", "Repository is actively maintained (not archived)",
+                "fail" if metadata.get("archived") else "pass",
+                "Repository is archived on GitHub." if metadata.get("archived") else "Repository is not archived.",
+                weights["repo_not_archived"], cat["repo_not_archived"],
+            ))
+        else:
+            checks.append(CheckResult("repo_not_archived", "Repository is actively maintained (not archived)", "na", "Not applicable (no repo metadata).", weights["repo_not_archived"], cat["repo_not_archived"]))
+
+        has_citation = any(p.upper() in ("CITATION.CFF", "CITATION.BIB", "CITATION") for p in tree)
         checks.append(CheckResult(
-            "repo_not_archived", "Repository is actively maintained (not archived)",
-            "fail" if metadata.get("archived") else "pass",
-            "Repository is archived on GitHub." if metadata.get("archived") else "Repository is not archived.",
-            _CHECK_WEIGHTS["repo_not_archived"],
+            "has_citation_file", "Has a CITATION file",
+            "pass" if has_citation else "warn",
+            "Found a CITATION file." if has_citation else "No CITATION.cff/CITATION file (informational -- not scored).",
+            0, cat["has_citation_file"],
         ))
     else:
-        checks.append(CheckResult("repo_not_archived", "Repository is actively maintained (not archived)", "na", "Not applicable (no repo metadata).", _CHECK_WEIGHTS["repo_not_archived"]))
-
-    has_citation = any(p.upper() in ("CITATION.CFF", "CITATION.BIB", "CITATION") for p in tree)
-    checks.append(CheckResult(
-        "has_citation_file", "Has a CITATION file",
-        "pass" if has_citation else "warn",
-        "Found a CITATION file." if has_citation else "No CITATION.cff/CITATION file (not required, but good academic practice).",
-        _CHECK_WEIGHTS["has_citation_file"],
-    ))
+        checks.append(_static_analysis_check(tree, get_content, weights["static_analysis_clean"]))
 
     return checks
 
 
 def score(checks: list[CheckResult]) -> tuple[int, str]:
-    applicable = [c for c in checks if c.status != "na"]
+    """Overall score across scored (non-warning, non-na) checks."""
+    applicable = [c for c in checks if c.category != "warning" and c.status != "na"]
     total_weight = sum(c.weight for c in applicable) or 1
     earned = sum(c.weight for c in applicable if c.status == "pass") + sum(c.weight * 0.5 for c in applicable if c.status == "warn")
     pct = round(100 * earned / total_weight)
@@ -267,6 +393,23 @@ def score(checks: list[CheckResult]) -> tuple[int, str]:
     return pct, verdict
 
 
+def category_scores(checks: list[CheckResult]) -> dict[str, int | None]:
+    """Per-category breakdown (e.g. {'documentation': 90, 'hygiene': 60,
+    'code_quality': None, 'correctness': 75}) instead of one opaque number.
+    None means no scored checks in that category applied (e.g. code_quality
+    is always None for profile="repo" -- ruff only runs on generated code)."""
+    result: dict[str, int | None] = {}
+    for c in CATEGORIES:
+        items = [chk for chk in checks if chk.category == c and chk.status != "na"]
+        if not items:
+            result[c] = None
+            continue
+        total = sum(chk.weight for chk in items) or 1
+        earned = sum(chk.weight for chk in items if chk.status == "pass") + sum(chk.weight * 0.5 for chk in items if chk.status == "warn")
+        result[c] = round(100 * earned / total)
+    return result
+
+
 def method_excerpt(paper: IngestedPaper) -> str:
     chunks = [s.text for s in paper.sections if s.heading.lower() in METHOD_HEADINGS]
     text = "\n\n".join(chunks) or paper.abstract
@@ -275,7 +418,9 @@ def method_excerpt(paper: IngestedPaper) -> str:
 
 def verify_claims(paper: IngestedPaper, tree: list[str], readme_content: str | None) -> list[dict]:
     """One bounded LLM call: does the codebase's structure/README plausibly
-    back up what the paper's Methods section claims was implemented?"""
+    back up what the paper's Methods section claims was implemented? Works
+    for either profile since it only needs the file tree/README, not full
+    code content."""
     method_text = method_excerpt(paper)
     if not method_text.strip():
         return []
@@ -319,18 +464,123 @@ Respond with ONLY a JSON object of this exact shape, no other text:
     return results
 
 
-def evaluate(paper: IngestedPaper, tree: list[str], get_content: GetContent, metadata: dict | None = None) -> dict:
-    """Run static checks + (optionally) claim verification against any
-    codebase, and package it into the shared report shape used by both
-    the repo-checker and the generator's self-check."""
-    checks = run_checks(tree, get_content, metadata)
-    pct, verdict = score(checks)
+def _collect_py_contents(tree: list[str], get_content: GetContent) -> dict[str, str]:
+    result = {}
+    for p in tree:
+        if p.endswith(".py"):
+            c = get_content(p)
+            if c:
+                result[p] = c
+    return result
+
+
+def semantic_review(paper: IngestedPaper, py_files: dict[str, str]) -> dict:
+    """Deeper than verify_claims: reviews the ACTUAL generated code content
+    (not just a file listing + README) against the paper's method, looking
+    for missing steps, hallucinated APIs, and shape mismatches -- issues
+    ruff and compile() structurally cannot catch. Generated-mode only: for a
+    fetched repo we'd need to download every source file's content just to
+    lint/review it, which is a real GitHub API cost tradeoff repo_fetch.py
+    deliberately avoids (see its docstring)."""
+    method_text = method_excerpt(paper)
+    if not method_text.strip() or not py_files:
+        return {"coverage_score": None, "findings": []}
+
+    code_excerpt = "\n\n".join(
+        f"--- {name} ---\n{content[:3000]}" for name, content in sorted(py_files.items())
+    )[: config.SEMANTIC_REVIEW_MAX_CODE_CHARS]
+
+    prompt = f"""PAPER METHOD/APPROACH EXCERPT:
+{method_text}
+
+GENERATED CODE:
+{code_excerpt}
+
+Review the generated code against the paper excerpt. Identify concrete issues: missing
+algorithmic steps described in the paper, calls to APIs/functions that don't plausibly
+exist, likely tensor/array shape mismatches, and other correctness concerns. Do not
+comment on style or formatting -- that's covered elsewhere.
+
+Respond with ONLY a JSON object of exactly this shape, no other text:
+{{"coverage_score": <integer 0-100 estimating how completely the paper's method is implemented>,
+  "findings": [{{"severity": "high|medium|low", "issue": "<one-sentence description>", "location": "<filename or 'general'>"}}]}}"""
+    raw = llm_client.complete_json(SEMANTIC_REVIEW_SYSTEM_PROMPT, prompt, max_tokens=config.SEMANTIC_REVIEW_MAX_TOKENS)
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"coverage_score": None, "findings": []}
+
+    score_val = parsed.get("coverage_score")
+    if not isinstance(score_val, (int, float)) or not (0 <= score_val <= 100):
+        score_val = None
+
+    findings = []
+    for item in parsed.get("findings", []):
+        if not isinstance(item, dict):
+            continue
+        severity = str(item.get("severity", "")).strip().lower()
+        issue = str(item.get("issue", "")).strip()
+        location = str(item.get("location", "")).strip() or "general"
+        if issue and severity in ("high", "medium", "low"):
+            findings.append({"severity": severity, "issue": issue, "location": location})
+
+    return {"coverage_score": int(score_val) if score_val is not None else None, "findings": findings}
+
+
+def _check_to_dict(c: CheckResult) -> dict:
+    return {"id": c.id, "label": c.label, "status": c.status, "detail": c.detail, "weight": c.weight, "category": c.category}
+
+
+def evaluate(paper: IngestedPaper, tree: list[str], get_content: GetContent, metadata: dict | None = None, profile: str = "repo") -> dict:
+    """Run static checks (+ semantic review, generated profile only) and
+    claim verification against any codebase, packaged into the shared report
+    shape used by both the repo-checker and the generator's self-check.
+
+    Response shape:
+    - checks: scored checks only (warning-category checks excluded)
+    - warnings: informational, non-scored checks (missing Dockerfile/CITATION)
+    - score / verdict: overall, from `checks` only
+    - category_scores: per-category breakdown (documentation/hygiene/
+      code_quality/correctness), None for categories with no applicable checks
+    - claims: paper-vs-code claim verification (both profiles)
+    - semantic_findings: LLM semantic review findings (generated profile only)
+    """
+    all_checks = run_checks(tree, get_content, metadata, profile=profile)
+
+    semantic_findings: list[dict] = []
+    if profile == "generated" and config.SEMANTIC_REVIEW_ENABLED:
+        py_contents = _collect_py_contents(tree, get_content)
+        review = semantic_review(paper, py_contents)
+        weight = _GENERATED_WEIGHTS["semantic_review"]
+        if review["coverage_score"] is None:
+            all_checks.append(CheckResult(
+                "semantic_review", "LLM semantic review vs. paper", "na",
+                "Semantic review could not be completed (no method text, no code, or the LLM call failed).",
+                weight, "correctness",
+            ))
+        else:
+            cov = review["coverage_score"]
+            status = "pass" if cov >= 80 else ("warn" if cov >= 50 else "fail")
+            detail = f"Estimated {cov}% coverage of the paper's described method ({len(review['findings'])} finding(s))."
+            all_checks.append(CheckResult("semantic_review", "LLM semantic review vs. paper", status, detail, weight, "correctness"))
+        semantic_findings = review["findings"]
+
+    scored_checks = [c for c in all_checks if c.category != "warning"]
+    warning_checks = [c for c in all_checks if c.category == "warning"]
+
+    pct, verdict = score(scored_checks)
+    cat_scores = category_scores(scored_checks)
+
     readme_path = find_readme_path(tree)
     readme_content = get_content(readme_path) if readme_path else None
     claims = verify_claims(paper, tree, readme_content) if config.REPRO_LLM_CLAIMS_ENABLED else []
+
     return {
-        "checks": [{"id": c.id, "label": c.label, "status": c.status, "detail": c.detail, "weight": c.weight} for c in checks],
+        "checks": [_check_to_dict(c) for c in scored_checks],
+        "warnings": [_check_to_dict(c) for c in warning_checks],
         "score": pct,
+        "category_scores": cat_scores,
         "verdict": verdict,
         "claims": claims,
+        "semantic_findings": semantic_findings,
     }
