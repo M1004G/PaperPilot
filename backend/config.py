@@ -66,6 +66,15 @@ REPRO_MAX_TREE_ENTRIES_IN_PROMPT = int(os.getenv("REPRO_MAX_TREE_ENTRIES_IN_PROM
 # The claim-verification LLM call is judgment, not a mechanical fact -- toggle
 # off to get static-checks-only (deterministic, no LLM cost/latency).
 REPRO_LLM_CLAIMS_ENABLED = os.getenv("REPRO_LLM_CLAIMS_ENABLED", "true").lower() == "true"
+# Timeout for each ruff subprocess call in the generated-code static analysis
+# check (repro_check_agent._run_ruff_on_file) -- one call per .py file.
+REPRO_RUFF_TIMEOUT_SECONDS = float(os.getenv("REPRO_RUFF_TIMEOUT_SECONDS", "10"))
+# LLM semantic review (generated code only): reviews actual code content
+# against the paper for missing steps / hallucinated APIs / shape mismatches
+# -- deeper than the file-tree-only claim verification above.
+SEMANTIC_REVIEW_ENABLED = os.getenv("SEMANTIC_REVIEW_ENABLED", "true").lower() == "true"
+SEMANTIC_REVIEW_MAX_TOKENS = int(os.getenv("SEMANTIC_REVIEW_MAX_TOKENS", "1000"))
+SEMANTIC_REVIEW_MAX_CODE_CHARS = int(os.getenv("SEMANTIC_REVIEW_MAX_CODE_CHARS", "12000"))
 
 # ---------- Codegen Agent ----------
 # Runs when no repo is linked/found for a paper: extracts structured methodology
