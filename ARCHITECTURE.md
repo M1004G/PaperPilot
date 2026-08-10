@@ -182,26 +182,28 @@ dict | None)` triple, not on GitHub specifically. Two things can feed it (see
 Orchestrator below): a real repo, or code the Codegen Agent just wrote. This
 is a deliberate design choice, not an accident of implementation order — see
 "Why one checker for both real and generated code?" below.
-- **Static checks (weighted, no LLM)** — README, license (+ whether it's a
-  recognized OSI license), dependency manifest presence + pinning ratio,
-  tests, CI config, Dockerfile/env spec, usage instructions in the README,
-  archived status, CITATION file. Weighted to a 0-100 score; code-hygiene
-  items (pinning, tests, CI, manifest) outweigh documentation extras. Checks
-  that need repo metadata (license identifier, archived status) return `na`
-  rather than `fail` when metadata is absent (i.e. for generated code, which
-  has no such metadata) — an absent signal isn't the same as a bad one.
+- **Four scored categories (Documentation, Hygiene, Code Quality, Correctness) + a separate non-scored Warnings list, not one opaque number and not informational checks silently shaping the score.** `run_checks(..., profile="repo"|"generated")` + `evaluate()` split the result into `checks` (scored), `warnings` (informational, weight-0, e.g. missing Dockerfile/CITATION — shown but never deducted), an overall `score`, and a `category_scores` breakdown (`None` for a category with no applicable checks in that profile, e.g. `code_quality` is always `None` under `profile="repo"`):
+  - `profile="repo"` — Documentation (README, usage instructions), Hygiene (license, recognized-OSI-license check, dependency manifest, CI, archived status), Correctness (pinned deps, tests). Both profiles' scored weights sum to 100 so the score is a clean percentage.
+  - `profile="generated"` — license/CI/archived-status checks are **not run at all** (not shown, not `na` clutter): code generated fresh in one session was never going to have a LICENSE file or CI, and scoring it down for that conflates repo-maintenance hygiene with implementation quality — the actual bug this profile split fixes (previously, well-generated code with no static/logic issues could still score ~50/100 purely for lacking things that don't apply to it). In place of that weight: **Code Quality** = a ruff-based static analysis check (`_static_analysis_check`), pyflakes rules only (`--isolated --select=F` — undefined names, unused imports/vars, redefinitions; cosmetic style like import ordering is deliberately excluded so it can't tank the score on trivia). **Correctness** additionally includes a **semantic review** (`semantic_review()`) — one LLM call given the paper's methodology excerpt and the *actual generated code content* (not just the file tree/README that claim verification sees), looking for missing algorithmic steps, calls to APIs/functions that don't plausibly exist, and likely tensor/shape mismatches. Layered signals, each catching what the others can't: `compile()` (Codegen Agent) catches "doesn't parse," ruff catches "parses but references things that don't exist," semantic review catches "runs fine but doesn't implement what the paper describes."
+- **Calibration check, not just a design claim**: a genuinely well-maintained repo (README, license, pinned manifest, tests, CI) scores 100 under `profile="repo"`; a real but minimal repo (README + license only, e.g. a famous single-file research repo with no manifest/tests/CI) scores in the mid-50s — a real gap, not a bug — while `profile="generated"` code with equivalent completeness is no longer penalized for lacking a LICENSE file it was never going to have. See `TestRepoScoringIsCalibrated` in `tests/test_repro_check_agent.py`.
 - **Claim verification (one bounded LLM call, optional)** — given the paper's
   Methods section and the codebase's file tree/README, judges whether each of
   up to 5 extracted implementation claims (e.g. "uses a transformer encoder")
   is `matches` / `unclear` / `not_evident`. Toggle off with
   `REPRO_LLM_CLAIMS_ENABLED=false` for a static-checks-only, LLM-free run.
+  Works identically for either profile (only needs the file tree/README, not
+  full code content) — unlike semantic review, which is generated-only.
 - `repo_fetch.py` is the GitHub-backed source: reads a repo's metadata, file
   tree, and individual file contents entirely through GitHub's REST API
   (`api.github.com` / `raw.githubusercontent.com`) — **no `git clone`, no code
   from the target repo is ever executed.** Only `github.com` URLs are
   accepted (the SSRF boundary), requests are timeout-bounded, and file/tree
   sizes are capped. `extract_code_url()` scans the paper's own text for a
-  linked repo; a user-supplied `repo_url` overrides that.
+  linked repo; a user-supplied `repo_url` overrides that. Semantic review and
+  ruff are deliberately **generated-profile only**, not applied to fetched
+  repos: running them there would mean downloading every source file's
+  content from GitHub just to lint/review it — a real API-cost tradeoff this
+  module avoids rather than an oversight.
 
 **Known limitation**: this checks whether code *looks* trustworthy and
 plausible against the paper's claims — it never runs anything, so it cannot
@@ -353,6 +355,11 @@ largely complete.
 | Code generation when no repo exists | ✅ **Done** — extract → plan → per-file dependency-ordered generation (see Codegen Agent above). |
 | Actually running generated/fetched code | **Still open, by design** — no execution happens anywhere in this suite (see design decision below). Generated `.py` files are syntax-validated (`compile()`, with a one-retry-on-error loop) before being accepted, which catches "doesn't even parse" — a real but narrow guarantee, not a substitute for running it. This is still the largest real gap versus what "reproducibility" fully means: a high score here means "looks trustworthy/complete and at least parses," not "confirmed to produce the paper's numbers." |
 | Reference-code retrieval (RAG over other implementations, à la DeepCode) | **Still open** — would need a search API dependency and materially larger LLM budget; a deliberate scoping decision for a lightweight app on Groq's free tier, not an oversight. |
+| Static analysis (ruff) | ✅ **Done** — `profile="generated"` runs pyflakes rules (undefined names, unused imports/vars) against generated `.py` files; see the Reproducibility Check Agent section above for why this replaced the license/CI/CITATION checks for generated code rather than being added alongside them. |
+| Category-based scoring (Documentation/Hygiene/Code Quality/Correctness) + non-scored Warnings | ✅ **Done** — `evaluate()` returns `category_scores` alongside the overall score, and separates informational checks (missing Dockerfile, missing CITATION) into a `warnings` list that never affects the score. |
+| LLM semantic review of generated code vs. paper | ✅ **Done** — `semantic_review()`, generated-profile only; reviews actual code content (not just the file tree) for missing steps, hallucinated APIs, shape mismatches. Generated-only because running it on a fetched repo would mean downloading every source file from GitHub just to review it. |
+| Two-tab frontend split (dedicated "Code Check" vs. "Code Generation" workflows), local filesystem repo input, model selection, a separate downloadable paper-coverage-report artifact | **Still open** — proposed in review feedback alongside the items above; deliberately deferred rather than half-built. The current single Reproducibility tab already branches its rendering by `mode`, but a real two-workflow UI, local-path ingestion, and model selection are each their own scoped pieces of work with no existing backend support to build on, not UI tweaks on top of what's here. |
+| AST/graph diffing, embedding similarity (CodeBLEU), symbolic execution/formal verification | **Considered, not adopted.** All of these need a *reference implementation* to compare against or diff against. In the generation path (the common case — no repo exists) there is no reference; the generated code is the only artifact, so there's nothing to diff it against. They'd only apply in repo-check mode by comparing a fetched repo to independently-generated code from the same paper, which is circular (both derived from the same source) rather than a real correctness check. Symbolic/formal methods additionally need specifications this project doesn't have and don't scale to arbitrary ML code. |
 | Config/architecture-diagram generation (à la PaperCoder's planning stage) | **Partially done** — the Plan stage produces a file list + dependencies (a plan), not an architecture diagram or a generated config file. |
 
 ### Recommended next iteration scope
