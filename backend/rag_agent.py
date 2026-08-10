@@ -141,6 +141,15 @@ class RAGIndex:
         dim = embeddings.shape[1]
         self.index = faiss.IndexFlatIP(dim)  # cosine similarity via normalized inner product
         self.index.add(embeddings)
+        # First Abstract-headed chunk, if any -- always injected into retrieval
+        # results (see retrieve()) rather than left to similarity scoring.
+        # A vague query like "what is the main objective of this paper" often
+        # doesn't lexically/semantically match how the abstract is phrased
+        # closely enough to make the top-K FAISS candidate pool at all, and a
+        # reranker can't rescue a chunk that was never retrieved in the first
+        # place -- so for the single most load-bearing chunk in the paper, we
+        # don't rely on scoring to surface it.
+        self._abstract_chunk_idx = next((i for i, c in enumerate(chunks) if c["heading"].lower() == "abstract"), None)
         logger.info("rag_index_built chunks=%d embed_elapsed=%.2fs", len(chunks), embed_elapsed)
 
     def retrieve(self, query: str, k: int = None) -> list[dict]:
@@ -188,7 +197,22 @@ class RAGIndex:
             "retrieve_timing embed=%.3fs search=%.3fs rerank=%.3fs candidates=%d",
             embed_elapsed, search_elapsed, rerank_elapsed, len(candidates),
         )
-        return candidates[:k]
+        results = candidates[:k]
+
+        if self._abstract_chunk_idx is not None and not any(c["chunk_id"] == self._abstract_chunk_idx for c in results):
+            abstract_chunk = self.chunks[self._abstract_chunk_idx]
+            pinned = {
+                "chunk_id": self._abstract_chunk_idx,
+                "text": abstract_chunk["text"],
+                "heading": abstract_chunk["heading"],
+                "page_start": abstract_chunk["page_start"],
+                "page_end": abstract_chunk["page_end"],
+                "embedding_score": 0.0,
+                "score": 0.0,  # pinned, not scored -- see note above on why
+            }
+            results = results[:-1] + [pinned] if results else [pinned]
+
+        return results
 
 
 def build_index(paper: IngestedPaper) -> RAGIndex:
