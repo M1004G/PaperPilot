@@ -143,10 +143,21 @@ with tab_repro:
             st.metric("Reproducibility score", f"{score}/100", data["verdict"])
             st.progress(score / 100)
 
-            st.markdown("**Static checks**")
+            cat_labels = {"documentation": "Documentation", "hygiene": "Project Hygiene", "code_quality": "Code Quality", "correctness": "Correctness"}
+            cols = st.columns(4)
+            for col, (cat_id, label) in zip(cols, cat_labels.items()):
+                val = (data.get("category_scores") or {}).get(cat_id)
+                col.metric(label, f"{val}/100" if val is not None else "N/A")
+
+            st.markdown("**Checks**")
             icon = {"pass": "✅", "warn": "⚠️", "fail": "❌", "na": "➖"}
             for c in data["checks"]:
                 st.markdown(f"{icon.get(c['status'], '•')} **{c['label']}** — {c['detail']}")
+
+            if data.get("warnings"):
+                with st.expander(f"⚠️ Warnings ({len(data['warnings'])}) — informational, not scored"):
+                    for w in data["warnings"]:
+                        st.markdown(f"⚠️ **{w['label']}** — {w['detail']}")
 
             st.markdown("**Claim verification (paper vs. code)**")
             if data.get("claims"):
@@ -155,6 +166,12 @@ with tab_repro:
                     st.markdown(f"{verdict_icon.get(item['verdict'], '•')} **{item['claim']}** — {item['evidence']}")
             else:
                 st.caption("No implementation claims were checked.")
+
+            if data.get("semantic_findings"):
+                st.markdown("**Semantic review findings (paper vs. generated code)**")
+                severity_icon = {"high": "🔴", "medium": "🟡", "low": "⚪"}
+                for f in data["semantic_findings"]:
+                    st.markdown(f"{severity_icon.get(f['severity'], '•')} **[{f['location']}]** {f['issue']}")
 
             if data.get("mode") == "generated" and data.get("files"):
                 st.markdown("---")
