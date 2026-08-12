@@ -11,28 +11,40 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import pytest
+from langchain_core.embeddings import Embeddings
 
 
-class FakeEmbedder:
-    """Deterministic fake embedder: same text always -> same vector, so
-    similarity comparisons in tests are reproducible without downloading
-    a real sentence-transformers model."""
+class FakeEmbedder(Embeddings):
+    """Deterministic fake embeddings, matching LangChain's Embeddings interface
+    (embed_documents/embed_query) since RAGIndex now builds its vectorstore via
+    langchain_community.vectorstores.FAISS.from_documents, which calls these
+    methods rather than a raw .encode(). Must actually subclass Embeddings --
+    langchain_community's FAISS wrapper does `isinstance(x, Embeddings)` and
+    falls back to treating anything else as a raw callable, which a duck-typed
+    fake object is not. Same text always -> same vector, so similarity
+    comparisons in tests are reproducible without downloading a real
+    sentence-transformers model."""
 
-    def encode(self, texts, normalize_embeddings=True, show_progress_bar=False):
-        vecs = []
-        for t in texts:
-            rng = np.random.RandomState(abs(hash(t)) % (2**32))
-            v = rng.rand(16).astype("float32")
-            v /= np.linalg.norm(v)
-            vecs.append(v)
-        return np.array(vecs, dtype="float32")
+    def _vec(self, text: str) -> list[float]:
+        rng = np.random.RandomState(abs(hash(text)) % (2**32))
+        v = rng.rand(16).astype("float32")
+        v /= np.linalg.norm(v)
+        return v.tolist()
+
+    def embed_documents(self, texts):
+        return [self._vec(t) for t in texts]
+
+    def embed_query(self, text):
+        return self._vec(text)
 
 
 class FakeReranker:
     """Deterministic fake cross-encoder: scores by word overlap between
-    query and chunk text, instead of downloading a real model."""
+    query and chunk text, instead of downloading a real model. Method is
+    named `score` (not `predict`) to match HuggingFaceCrossEncoder's API,
+    which rag_agent.py now calls directly."""
 
-    def predict(self, pairs):
+    def score(self, pairs):
         return [
             float(len(set(q.lower().split()) & set(t.lower().split())))
             for q, t in pairs
@@ -44,7 +56,7 @@ def fake_embedding_models(monkeypatch):
     """Applied to every test automatically: no test should need real
     sentence-transformers/cross-encoder downloads."""
     from backend import rag_agent
-    monkeypatch.setattr(rag_agent, "_get_embedder", lambda: FakeEmbedder())
+    monkeypatch.setattr(rag_agent, "_get_embeddings", lambda: FakeEmbedder())
     monkeypatch.setattr(rag_agent, "_get_reranker", lambda: FakeReranker())
 
 
