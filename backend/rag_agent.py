@@ -1,112 +1,78 @@
 """RAG Agent: chunk + embed + index + retrieve + grounded chat answer.
 
-Chunking is now sentence-aware (chunks never split mid-sentence) and each chunk
-carries section heading + page metadata, so the LLM can ground answers in
-"where this came from" rather than an anonymous blob of text. Retrieval also
-adds an optional cross-encoder rerank pass over a wider FAISS candidate pool.
+Retrieval infrastructure is built on LangChain: RecursiveCharacterTextSplitter
+for chunking, langchain_chroma's Chroma vectorstore + HuggingFace embeddings
+for indexing, and HuggingFaceCrossEncoder for reranking. The final
+answer-generation call deliberately still goes through our own llm_client
+(not langchain_groq's chat model) -- llm_client already has tested
+retry/backoff and rate-limit handling for Groq's free tier.
+
+Each document gets its own persistent Chroma collection (data/chroma/,
+collection name derived from doc_id), so a server restart reuses the
+already-embedded vectors instead of re-embedding chunk text from scratch --
+unlike the previous FAISS-based version, which held vectors in memory only
+and rebuilt them from persisted chunk text on every load. Each chunk carries
+section heading + page metadata, so the LLM can ground answers in "where
+this came from" rather than an anonymous blob of text.
 """
 import logging
-import re
 import time
+import uuid
 
-import numpy as np
-import faiss
-from sentence_transformers import SentenceTransformer, CrossEncoder
+from langchain_chroma import Chroma
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+from langchain_core.documents import Document
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from backend import llm_client, config
 from backend.ingestion_agent import IngestedPaper, Section
 
 logger = logging.getLogger("paperpilot.rag")
 
-_embedder = None
+_embeddings = None
 _reranker = None
 
-# Sentence boundary: a period/question/exclamation followed by whitespace and a
-# capital letter or digit (good-enough heuristic that also copes with "et al."
-# style abbreviations reasonably well since it requires the following token to
-# start a new sentence-looking chunk).
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9])")
+
+def _get_embeddings() -> HuggingFaceEmbeddings:
+    global _embeddings
+    if _embeddings is None:
+        _embeddings = HuggingFaceEmbeddings(
+            model_name=config.EMBEDDING_MODEL_NAME,
+            encode_kwargs={"normalize_embeddings": True},
+        )
+    return _embeddings
 
 
-def _get_embedder() -> SentenceTransformer:
-    global _embedder
-    if _embedder is None:
-        _embedder = SentenceTransformer(config.EMBEDDING_MODEL_NAME)
-    return _embedder
-
-
-def _get_reranker() -> CrossEncoder:
+def _get_reranker() -> HuggingFaceCrossEncoder:
     global _reranker
     if _reranker is None:
-        _reranker = CrossEncoder(config.RERANK_MODEL_NAME)
+        _reranker = HuggingFaceCrossEncoder(model_name=config.RERANK_MODEL_NAME)
     return _reranker
 
 
-def _split_sentences(text: str) -> list[str]:
-    text = text.strip()
-    if not text:
-        return []
-    # Collapse whitespace within paragraphs first so the regex sees clean gaps.
-    text = re.sub(r"[ \t]+", " ", text)
-    sentences = _SENTENCE_SPLIT_RE.split(text)
-    return [s.strip() for s in sentences if s.strip()]
-
-
-def _sentences_with_pages(section: Section) -> list[tuple[int, str]]:
-    """Split each page-segment of a section into sentences, tagging each sentence
-    with the actual page it came from."""
-    tagged: list[tuple[int, str]] = []
-    segments = section.page_segments or [(section.page_start, section.text)]
-    for page_num, seg_text in segments:
-        for sentence in _split_sentences(seg_text):
-            tagged.append((page_num, sentence))
-    return tagged
-
-
 def chunk_section(section: Section, chunk_size: int = None, overlap: int = None) -> list[dict]:
-    """Pack a section's sentences into ~chunk_size chunks without splitting mid-sentence.
-    Each chunk's page_start/page_end reflects only the pages its own sentences came from
-    (usually one page; two only if the chunk happens to straddle a page break)."""
+    """Split one section into chunks via LangChain's RecursiveCharacterTextSplitter,
+    one page-segment at a time so every resulting chunk maps to exactly one
+    page (page_start == page_end always)."""
     chunk_size = chunk_size or config.CHUNK_SIZE
     overlap = overlap or config.CHUNK_OVERLAP
-    tagged_sentences = _sentences_with_pages(section)
-    if not tagged_sentences:
-        return []
+    segments = section.page_segments or [(section.page_start, section.text)]
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size, chunk_overlap=overlap,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
 
     chunks: list[dict] = []
-    current: list[tuple[int, str]] = []
-    current_len = 0
-
-    def _flush():
-        if current:
-            pages = [p for p, _ in current]
-            chunks.append({
-                "text": " ".join(s for _, s in current).strip(),
-                "heading": section.heading,
-                "page_start": min(pages),
-                "page_end": max(pages),
-            })
-
-    for page_num, sentence in tagged_sentences:
-        # A single sentence longer than chunk_size is kept whole rather than cut mid-word;
-        # over-long chunks are rare and better than corrupting a sentence.
-        if current_len + len(sentence) + 1 > chunk_size and current:
-            _flush()
-            # Carry the tail of the previous chunk forward for overlap/context continuity.
-            overlap_sentences = []
-            overlap_len = 0
-            for p, s in reversed(current):
-                if overlap_len + len(s) > overlap:
-                    break
-                overlap_sentences.insert(0, (p, s))
-                overlap_len += len(s)
-            current = overlap_sentences
-            current_len = overlap_len
-
-        current.append((page_num, sentence))
-        current_len += len(sentence) + 1
-
-    _flush()
+    for page_num, seg_text in segments:
+        if not seg_text.strip():
+            continue
+        doc = Document(page_content=seg_text.strip())
+        for split_doc in splitter.split_documents([doc]):
+            text = split_doc.page_content.strip()
+            if text:
+                chunks.append({"text": text, "heading": section.heading, "page_start": page_num, "page_end": page_num})
     return chunks
 
 
@@ -122,70 +88,96 @@ def chunk_paper(paper: IngestedPaper, chunk_size: int = None, overlap: int = Non
         if chunks:
             return chunks
 
-    # Fallback: treat the whole document as one unlabeled section.
     fallback_section = Section(heading="Full Text", text=paper.full_text, page_start=1, page_end=paper.num_pages or 1)
     return chunk_section(fallback_section, chunk_size, overlap)
 
 
-class RAGIndex:
-    """Holds the FAISS index + chunk metadata for a single document."""
+def _chroma_kwargs(doc_id: str | None) -> dict:
+    """Persistent, doc_id-keyed collection for real sessions; an ephemeral,
+    unpersisted, uniquely-named collection when doc_id is None (tests, or any
+    ad-hoc index that shouldn't leave data behind on disk)."""
+    if doc_id is None:
+        return {"collection_name": f"ephemeral_{uuid.uuid4().hex[:12]}"}
+    return {"collection_name": f"doc_{doc_id}", "persist_directory": str(config.CHROMA_PERSIST_DIR)}
 
-    def __init__(self, chunks: list[dict]):
+
+class RAGIndex:
+    """Holds the Chroma vectorstore + chunk metadata for a single document.
+
+    `doc_id`, when provided, makes the underlying Chroma collection durable
+    across restarts (see module docstring). If a collection already exists
+    for that doc_id with a chunk count matching `chunks`, it's reused as-is
+    -- no re-embedding. A mismatched count (e.g. chunking logic changed
+    between versions, or the collection is otherwise stale) triggers a full
+    reset and re-embed, rather than trusting possibly-inconsistent data.
+    """
+
+    def __init__(self, chunks: list[dict], doc_id: str = None):
         self.chunks = chunks
-        embedder = _get_embedder()
-        texts = [c["text"] for c in chunks]
+        self.doc_id = doc_id
         t0 = time.monotonic()
-        embeddings = embedder.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+
+        self.vectorstore = Chroma(
+            embedding_function=_get_embeddings(),
+            collection_metadata={"hnsw:space": "cosine"},
+            **_chroma_kwargs(doc_id),
+        )
+        existing_count = self.vectorstore._collection.count()
+
+        if existing_count == len(chunks) and existing_count > 0:
+            reused = True
+        else:
+            if existing_count:
+                self.vectorstore.reset_collection()
+            docs = [
+                Document(
+                    page_content=c["text"],
+                    metadata={"chunk_id": i, "heading": c["heading"], "page_start": c["page_start"], "page_end": c["page_end"]},
+                )
+                for i, c in enumerate(chunks)
+            ]
+            if docs:
+                self.vectorstore.add_documents(docs, ids=[str(i) for i in range(len(docs))])
+            reused = False
+
         embed_elapsed = time.monotonic() - t0
-        embeddings = np.asarray(embeddings, dtype="float32")
-        dim = embeddings.shape[1]
-        self.index = faiss.IndexFlatIP(dim)  # cosine similarity via normalized inner product
-        self.index.add(embeddings)
-        # First Abstract-headed chunk, if any -- always injected into retrieval
-        # results (see retrieve()) rather than left to similarity scoring.
-        # A vague query like "what is the main objective of this paper" often
-        # doesn't lexically/semantically match how the abstract is phrased
-        # closely enough to make the top-K FAISS candidate pool at all, and a
-        # reranker can't rescue a chunk that was never retrieved in the first
-        # place -- so for the single most load-bearing chunk in the paper, we
-        # don't rely on scoring to surface it.
         self._abstract_chunk_idx = next((i for i, c in enumerate(chunks) if c["heading"].lower() == "abstract"), None)
-        logger.info("rag_index_built chunks=%d embed_elapsed=%.2fs", len(chunks), embed_elapsed)
+        logger.info(
+            "rag_index_built doc_id=%s chunks=%d reused_existing=%s elapsed=%.2fs",
+            doc_id, len(chunks), reused, embed_elapsed,
+        )
 
     def retrieve(self, query: str, k: int = None) -> list[dict]:
         k = k or config.TOP_K
-        embedder = _get_embedder()
+        pool_size = min(config.RERANK_CANDIDATE_POOL if config.RERANK_ENABLED else k, len(self.chunks)) or 1
+
         t0 = time.monotonic()
-        q_emb = embedder.encode([query], normalize_embeddings=True)
-        embed_elapsed = time.monotonic() - t0
-        q_emb = np.asarray(q_emb, dtype="float32")
+        scored_docs = self.vectorstore.similarity_search_with_score(query, k=pool_size)
+        search_elapsed = time.monotonic() - t0
 
-        pool_size = min(config.RERANK_CANDIDATE_POOL if config.RERANK_ENABLED else k, len(self.chunks))
-        t1 = time.monotonic()
-        scores, indices = self.index.search(q_emb, pool_size)
-        search_elapsed = time.monotonic() - t1
-
-        candidates = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx == -1:
-                continue
-            chunk = self.chunks[idx]
-            candidates.append({
-                "chunk_id": int(idx),
-                "text": chunk["text"],
-                "heading": chunk["heading"],
-                "page_start": chunk["page_start"],
-                "page_end": chunk["page_end"],
-                "embedding_score": float(score),
-            })
+        candidates = [
+            {
+                "chunk_id": doc.metadata["chunk_id"],
+                "text": doc.page_content,
+                "heading": doc.metadata["heading"],
+                "page_start": doc.metadata["page_start"],
+                "page_end": doc.metadata["page_end"],
+                # Chroma returns a distance (lower = more similar); invert to a
+                # similarity-style score so "higher = more relevant" holds for
+                # every score this module produces, matching what callers
+                # (frontend, sources list) already expect.
+                "embedding_score": -float(score),
+            }
+            for doc, score in scored_docs
+        ]
 
         rerank_elapsed = 0.0
         if config.RERANK_ENABLED and len(candidates) > 1:
             reranker = _get_reranker()
-            pairs = [[query, c["text"]] for c in candidates]
-            t2 = time.monotonic()
-            rerank_scores = reranker.predict(pairs)
-            rerank_elapsed = time.monotonic() - t2
+            pairs = [(query, c["text"]) for c in candidates]
+            t1 = time.monotonic()
+            rerank_scores = reranker.score(pairs)
+            rerank_elapsed = time.monotonic() - t1
             for c, rs in zip(candidates, rerank_scores):
                 c["score"] = float(rs)
             candidates.sort(key=lambda c: c["score"], reverse=True)
@@ -194,8 +186,8 @@ class RAGIndex:
                 c["score"] = c["embedding_score"]
 
         logger.info(
-            "retrieve_timing embed=%.3fs search=%.3fs rerank=%.3fs candidates=%d",
-            embed_elapsed, search_elapsed, rerank_elapsed, len(candidates),
+            "retrieve_timing search=%.3fs rerank=%.3fs candidates=%d",
+            search_elapsed, rerank_elapsed, len(candidates),
         )
         results = candidates[:k]
 
@@ -208,16 +200,16 @@ class RAGIndex:
                 "page_start": abstract_chunk["page_start"],
                 "page_end": abstract_chunk["page_end"],
                 "embedding_score": 0.0,
-                "score": 0.0,  # pinned, not scored -- see note above on why
+                "score": 0.0,
             }
             results = results[:-1] + [pinned] if results else [pinned]
 
         return results
 
 
-def build_index(paper: IngestedPaper) -> RAGIndex:
+def build_index(paper: IngestedPaper, doc_id: str = None) -> RAGIndex:
     chunks = chunk_paper(paper)
-    return RAGIndex(chunks)
+    return RAGIndex(chunks, doc_id)
 
 
 SYSTEM_PROMPT = (
@@ -234,9 +226,6 @@ def _format_chunk(r: dict) -> str:
 
 
 def _bounded_history(history: list[dict]) -> list[dict]:
-    """Keep the most recent turns up to a character budget (proxy for token budget),
-    rather than a fixed turn count -- a handful of long turns can still blow past a
-    reasonable prompt size even under the old history[-6:] cap."""
     kept: list[dict] = []
     used = 0
     for turn in reversed(history):
