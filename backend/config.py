@@ -9,6 +9,8 @@ load_dotenv()
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "sessions.db"
+CHROMA_PERSIST_DIR = DATA_DIR / "chroma"
+CHROMA_PERSIST_DIR.mkdir(exist_ok=True)
 
 # ---------- Upload validation ----------
 MAX_PDF_SIZE_MB = int(os.getenv("MAX_PDF_SIZE_MB", "25"))
