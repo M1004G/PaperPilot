@@ -46,10 +46,11 @@ class Orchestrator:
     def _load_persisted_sessions(self):
         for row in persistence.load_all_sessions():
             try:
-                # Rebuilding the FAISS index locally re-embeds chunk text via the
-                # embedding model -- no Groq API calls, so this is cheap and avoids
-                # needing to serialize/deserialize FAISS indexes across restarts.
-                rag_index = rag_agent.RAGIndex(row["chunks"])
+                # Chroma collections are persisted to disk keyed by doc_id, so
+                # this reuses already-embedded vectors when the chunk count
+                # matches rather than re-embedding from scratch -- see
+                # RAGIndex's docstring in rag_agent.py.
+                rag_index = rag_agent.RAGIndex(row["chunks"], row["doc_id"])
                 session = DocSession(
                     doc_id=row["doc_id"],
                     paper=row["paper"],
@@ -73,13 +74,13 @@ class Orchestrator:
         t0 = time.monotonic()
         paper = ingestion_agent.ingest(pdf_path)
         t1 = time.monotonic()
-        rag_index = rag_agent.build_index(paper)
+        doc_id = str(uuid.uuid4())[:8]
+        rag_index = rag_agent.build_index(paper, doc_id)
         t2 = time.monotonic()
         logger.info(
             "ingest_timing parse=%.2fs index_build=%.2fs total=%.2fs pages=%d sections=%d chunks=%d",
             t1 - t0, t2 - t1, t2 - t0, paper.num_pages, len(paper.sections), len(rag_index.chunks),
         )
-        doc_id = str(uuid.uuid4())[:8]
         session = DocSession(doc_id=doc_id, paper=paper, rag_index=rag_index)
         with self._lock:
             self.sessions[doc_id] = session
@@ -199,7 +200,7 @@ class Orchestrator:
                     "paper_info": None, "files": {}, "gap_report": None, "note": str(e),
                 }
             get_content = lambda path: repo_fetch.fetch_file_content(owner, repo, branch, path)
-            evaluation = repro_check_agent.evaluate(paper, tree, get_content, metadata)
+            evaluation = repro_check_agent.evaluate(paper, tree, get_content, metadata, profile="repo")
             return {
                 "mode": "repo_check", "repo_url": metadata["html_url"], "repo_metadata": metadata,
                 "paper_info": None, "files": {}, "gap_report": None, "note": None,
@@ -218,7 +219,7 @@ class Orchestrator:
                         "(check GROQ_API_KEY / CODEGEN_ENABLED / logs for the underlying error).",
             }
         tree = sorted(files.keys())
-        evaluation = repro_check_agent.evaluate(paper, tree, files.get, metadata=None)
+        evaluation = repro_check_agent.evaluate(paper, tree, files.get, metadata=None, profile="generated")
         return {
             "mode": "generated", "repo_url": None, "repo_metadata": None,
             "paper_info": generated["paper_info"], "files": files, "gap_report": generated["gap_report"],
