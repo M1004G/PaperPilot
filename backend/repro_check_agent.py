@@ -72,14 +72,24 @@ CATEGORIES = ("documentation", "hygiene", "code_quality", "correctness")
 
 # Category each check belongs to. "warning" is not a scored category --
 # checks with this category are informational only (see evaluate()).
+# has_license/license_is_recognized/has_ci/repo_not_archived only ever fire
+# for profile="repo", so demoting them to "warning" here can't affect
+# profile="generated" scoring. has_tests and dependencies_pinned are shared
+# across both profiles -- their category is decided per-profile in
+# run_checks() instead (see _tests_and_deps_category below), since for
+# generated code they're still a meaningful correctness signal but for a
+# fetched repo they're SWE-hygiene, not evidence the method is implemented
+# correctly (a repo can have full test coverage around a wrong algorithm,
+# or zero tests around a correct one -- see semantic_review for the actual
+# correctness signal).
 _CHECK_CATEGORY = {
     "has_readme": "documentation",
     "readme_has_usage_instructions": "documentation",
-    "has_license": "hygiene",
-    "license_is_recognized": "hygiene",
+    "has_license": "warning",
+    "license_is_recognized": "warning",
     "has_dependency_manifest": "hygiene",
-    "has_ci": "hygiene",
-    "repo_not_archived": "hygiene",
+    "has_ci": "warning",
+    "repo_not_archived": "warning",
     "dependencies_pinned": "correctness",
     "has_tests": "correctness",
     "static_analysis_clean": "code_quality",
@@ -88,18 +98,37 @@ _CHECK_CATEGORY = {
     "has_citation_file": "warning",
 }
 
+
+def _tests_and_deps_category(check_id: str, profile: str) -> str:
+    """has_tests/dependencies_pinned are structural presence checks -- real
+    correctness signal for profile="generated" (there's no other test-
+    coverage signal there), but for profile="repo" they measure SWE hygiene,
+    not whether the code implements the paper's method. Demoted to warning
+    only for repo profile; generated profile keeps the base category."""
+    if profile == "repo" and check_id in ("has_tests", "dependencies_pinned"):
+        return "warning"
+    return _CHECK_CATEGORY[check_id]
+
+
 # Weights sum to 100 within each profile's *scored* checks (warning-category
 # checks aren't weighted -- their weight is irrelevant to scoring).
+# Repo-profile weighting: semantic_review (does the code's actual content
+# implement the paper's method, per LLM review of real code excerpts) now
+# dominates the score. License/CI/archived-status/tests/dependency-pinning
+# are demoted to warnings above -- they're software-engineering hygiene,
+# not evidence of implementation correctness, and were previously ~50-65%
+# of the score despite measuring something orthogonal to reproducibility.
 _REPO_CHECK_WEIGHTS = {
     "has_readme": 10,
-    "readme_has_usage_instructions": 10,
-    "has_license": 15,
-    "license_is_recognized": 5,
+    "readme_has_usage_instructions": 5,
+    "has_license": 0,
+    "license_is_recognized": 0,
     "has_dependency_manifest": 15,
-    "has_ci": 10,
-    "repo_not_archived": 5,
-    "dependencies_pinned": 15,
-    "has_tests": 15,
+    "has_ci": 0,
+    "repo_not_archived": 0,
+    "dependencies_pinned": 0,
+    "has_tests": 0,
+    "semantic_review": 70,
     "has_dockerfile_or_env_spec": 0,
     "has_citation_file": 0,
 }
@@ -311,7 +340,7 @@ def run_checks(tree: list[str], get_content: GetContent, metadata: dict | None =
             status, detail = "fail", f"{ratio:.0%} of dependencies are version-pinned -- reproducibility risk."
     else:
         status, detail = "na", "No manifest found to check."
-    checks.append(CheckResult("dependencies_pinned", "Dependencies are version-pinned", status, detail, weights["dependencies_pinned"], cat["dependencies_pinned"]))
+    checks.append(CheckResult("dependencies_pinned", "Dependencies are version-pinned", status, detail, weights["dependencies_pinned"], _tests_and_deps_category("dependencies_pinned", profile)))
 
     has_tests = any(
         "test" in seg.lower()
@@ -323,7 +352,7 @@ def run_checks(tree: list[str], get_content: GetContent, metadata: dict | None =
         "has_tests", "Has a test suite",
         "pass" if has_tests else "fail",
         "Found test files/directory." if has_tests else "No tests/ directory or test_*/*_test files found.",
-        weights["has_tests"], cat["has_tests"],
+        weights["has_tests"], _tests_and_deps_category("has_tests", profile),
     ))
 
     if profile == "repo":
@@ -416,17 +445,56 @@ def method_excerpt(paper: IngestedPaper) -> str:
     return text[:5000]
 
 
-def verify_claims(paper: IngestedPaper, tree: list[str], readme_content: str | None) -> list[dict]:
-    """One bounded LLM call: does the codebase's structure/README plausibly
-    back up what the paper's Methods section claims was implemented? Works
-    for either profile since it only needs the file tree/README, not full
-    code content."""
+_CODE_SIGNAL_NAME_HINTS = (
+    "train", "main", "model", "method", "algorithm", "core", "loss", "run",
+)
+
+
+def _select_claim_code_files(tree: list[str]) -> list[str]:
+    """Pick a small, bounded set of .py files likely to contain the actual
+    method implementation, for claim verification to actually read. Not
+    exhaustive (see repo_fetch.py's cost tradeoff) -- just enough that a
+    terse-README repo isn't judged on filenames alone.
+
+    Preference order: shallow path depth, then filename matches a
+    method-signal keyword, then first-seen order (deterministic)."""
+    py_files = [p for p in tree if p.endswith(".py") and "/test" not in p.lower() and not p.lower().startswith("test")]
+
+    def sort_key(path: str) -> tuple[int, int, str]:
+        depth = path.count("/")
+        name = path.rsplit("/", 1)[-1].lower()
+        has_hint = 0 if any(hint in name for hint in _CODE_SIGNAL_NAME_HINTS) else 1
+        return (depth, has_hint, path)
+
+    return sorted(py_files, key=sort_key)[: config.REPRO_CLAIMS_MAX_CODE_FILES]
+
+
+def verify_claims(
+    paper: IngestedPaper,
+    tree: list[str],
+    readme_content: str | None,
+    code_excerpts: dict[str, str] | None = None,
+) -> list[dict]:
+    """One bounded LLM call: does the codebase plausibly back up what the
+    paper's Methods section claims was implemented? Uses the file tree and
+    README always, plus actual content from a small, bounded set of
+    high-signal .py files when available (code_excerpts) -- a README rarely
+    restates paper-language like "convex combinations of examples", so
+    tree/README alone under-confirms real implementations."""
     method_text = method_excerpt(paper)
     if not method_text.strip():
         return []
 
     tree_summary = "\n".join(tree[: config.REPRO_MAX_TREE_ENTRIES_IN_PROMPT])
     readme_excerpt = (readme_content or "(no README available)")[:3000]
+    code_excerpts = code_excerpts or {}
+    code_block = (
+        "\n\n".join(
+            f"--- {name} ---\n{content[: config.REPRO_CLAIMS_CODE_FILE_CHARS]}"
+            for name, content in sorted(code_excerpts.items())
+        )
+        or "(no code excerpts available)"
+    )
 
     prompt = f"""PAPER METHOD/APPROACH EXCERPT:
 {method_text}
@@ -437,14 +505,19 @@ CODEBASE FILE LISTING:
 CODEBASE README (excerpt):
 {readme_excerpt}
 
+CODE EXCERPTS (a handful of likely-relevant files, not the full codebase):
+{code_block}
+
 Identify up to 5 concrete implementation claims from the paper excerpt (e.g. "uses a
 transformer encoder", "trained with the Adam optimizer", "releases pretrained
 checkpoints", "evaluated with a custom benchmark script"). For each, judge whether the
-file listing/README gives concrete evidence for it.
+file listing/README/code excerpts give concrete evidence for it -- prefer the code
+excerpts as evidence over the README when both are available, since code is the
+ground truth and README prose is often incomplete or stale.
 
 Respond with ONLY a JSON object of this exact shape, no other text:
 {{"claims": [
-  {{"claim": "<one-sentence claim from the paper>", "verdict": "matches|unclear|not_evident", "evidence": "<short reason citing a file/README detail, or 'no supporting file/README evidence'>"}}
+  {{"claim": "<one-sentence claim from the paper>", "verdict": "matches|unclear|not_evident", "evidence": "<short reason citing a file/README/code detail, or 'no supporting evidence'>"}}
 ]}}"""
     raw = llm_client.complete_json(CLAIM_SYSTEM_PROMPT, prompt, max_tokens=600)
     try:
@@ -474,14 +547,15 @@ def _collect_py_contents(tree: list[str], get_content: GetContent) -> dict[str, 
     return result
 
 
-def semantic_review(paper: IngestedPaper, py_files: dict[str, str]) -> dict:
-    """Deeper than verify_claims: reviews the ACTUAL generated code content
-    (not just a file listing + README) against the paper's method, looking
-    for missing steps, hallucinated APIs, and shape mismatches -- issues
-    ruff and compile() structurally cannot catch. Generated-mode only: for a
-    fetched repo we'd need to download every source file's content just to
-    lint/review it, which is a real GitHub API cost tradeoff repo_fetch.py
-    deliberately avoids (see its docstring)."""
+def semantic_review(paper: IngestedPaper, py_files: dict[str, str], profile: str = "generated") -> dict:
+    """Reviews ACTUAL code content (not just a file listing + README) against
+    the paper's method, looking for missing steps, hallucinated APIs, and
+    shape mismatches -- issues ruff and compile() structurally cannot catch.
+    Runs for both profiles: for profile="generated", py_files is typically
+    every generated .py file (small by construction); for profile="repo",
+    callers should pass the same bounded, high-signal excerpt set used for
+    verify_claims() (see _select_claim_code_files) rather than the whole
+    repo, to respect repo_fetch.py's fetch-cost tradeoff."""
     method_text = method_excerpt(paper)
     if not method_text.strip() or not py_files:
         return {"coverage_score": None, "findings": []}
@@ -489,17 +563,20 @@ def semantic_review(paper: IngestedPaper, py_files: dict[str, str]) -> dict:
     code_excerpt = "\n\n".join(
         f"--- {name} ---\n{content[:3000]}" for name, content in sorted(py_files.items())
     )[: config.SEMANTIC_REVIEW_MAX_CODE_CHARS]
+    code_label = "GENERATED CODE" if profile == "generated" else "CODE (excerpt -- a bounded subset of the repo's files, not the whole codebase)"
 
     prompt = f"""PAPER METHOD/APPROACH EXCERPT:
 {method_text}
 
-GENERATED CODE:
+{code_label}:
 {code_excerpt}
 
-Review the generated code against the paper excerpt. Identify concrete issues: missing
+Review the code against the paper excerpt. Identify concrete issues: missing
 algorithmic steps described in the paper, calls to APIs/functions that don't plausibly
 exist, likely tensor/array shape mismatches, and other correctness concerns. Do not
-comment on style or formatting -- that's covered elsewhere.
+comment on style or formatting -- that's covered elsewhere. If this is only an excerpt
+of a larger codebase, judge coverage based on what's shown and say so in a finding
+rather than assuming missing pieces are absent from the full repo.
 
 Respond with ONLY a JSON object of exactly this shape, no other text:
 {{"coverage_score": <integer 0-100 estimating how completely the paper's method is implemented>,
@@ -547,11 +624,26 @@ def evaluate(paper: IngestedPaper, tree: list[str], get_content: GetContent, met
     """
     all_checks = run_checks(tree, get_content, metadata, profile=profile)
 
+    readme_path = find_readme_path(tree)
+    readme_content = get_content(readme_path) if readme_path else None
+
+    # For profile="repo", fetch the bounded, high-signal code excerpt set
+    # ONCE and reuse it for both claim verification and semantic review --
+    # avoids two separate GitHub fetch passes over the same files.
+    code_excerpts: dict[str, str] = {}
+    if profile == "repo":
+        for path in _select_claim_code_files(tree):
+            content = get_content(path)
+            if content:
+                code_excerpts[path] = content
+    else:
+        code_excerpts = _collect_py_contents(tree, get_content)
+
     semantic_findings: list[dict] = []
-    if profile == "generated" and config.SEMANTIC_REVIEW_ENABLED:
-        py_contents = _collect_py_contents(tree, get_content)
-        review = semantic_review(paper, py_contents)
-        weight = _GENERATED_WEIGHTS["semantic_review"]
+    weights = _REPO_CHECK_WEIGHTS if profile == "repo" else _GENERATED_WEIGHTS
+    if config.SEMANTIC_REVIEW_ENABLED:
+        review = semantic_review(paper, code_excerpts, profile=profile)
+        weight = weights["semantic_review"]
         if review["coverage_score"] is None:
             all_checks.append(CheckResult(
                 "semantic_review", "LLM semantic review vs. paper", "na",
@@ -571,9 +663,9 @@ def evaluate(paper: IngestedPaper, tree: list[str], get_content: GetContent, met
     pct, verdict = score(scored_checks)
     cat_scores = category_scores(scored_checks)
 
-    readme_path = find_readme_path(tree)
-    readme_content = get_content(readme_path) if readme_path else None
-    claims = verify_claims(paper, tree, readme_content) if config.REPRO_LLM_CLAIMS_ENABLED else []
+    claims = []
+    if config.REPRO_LLM_CLAIMS_ENABLED:
+        claims = verify_claims(paper, tree, readme_content, code_excerpts if profile == "repo" else None)
 
     return {
         "checks": [_check_to_dict(c) for c in scored_checks],

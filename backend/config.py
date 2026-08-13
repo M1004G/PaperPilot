@@ -68,6 +68,14 @@ REPRO_MAX_TREE_ENTRIES_IN_PROMPT = int(os.getenv("REPRO_MAX_TREE_ENTRIES_IN_PROM
 # The claim-verification LLM call is judgment, not a mechanical fact -- toggle
 # off to get static-checks-only (deterministic, no LLM cost/latency).
 REPRO_LLM_CLAIMS_ENABLED = os.getenv("REPRO_LLM_CLAIMS_ENABLED", "true").lower() == "true"
+# Claim verification was previously file-tree + README only, which structurally
+# can't confirm implementation-level claims a README never restates in prose.
+# This fetches a SMALL, bounded number of likely-relevant .py files' actual
+# content as additional evidence -- not every file (that's the repo_fetch.py
+# cost tradeoff this still respects), just enough to stop claim verification
+# from failing every check by construction on terse-README repos.
+REPRO_CLAIMS_MAX_CODE_FILES = int(os.getenv("REPRO_CLAIMS_MAX_CODE_FILES", "3"))
+REPRO_CLAIMS_CODE_FILE_CHARS = int(os.getenv("REPRO_CLAIMS_CODE_FILE_CHARS", "2000"))
 # Timeout for each ruff subprocess call in the generated-code static analysis
 # check (repro_check_agent._run_ruff_on_file) -- one call per .py file.
 REPRO_RUFF_TIMEOUT_SECONDS = float(os.getenv("REPRO_RUFF_TIMEOUT_SECONDS", "10"))
@@ -95,3 +103,14 @@ CODEGEN_MAX_FILES = int(os.getenv("CODEGEN_MAX_FILES", "8"))
 # Below this length, generated file content is treated as a refusal/empty
 # response rather than real output (see codegen_agent._looks_like_refusal_or_empty).
 CODEGEN_MIN_FILE_CHARS = int(os.getenv("CODEGEN_MIN_FILE_CHARS", "20"))
+
+# ---------- Discovery Agent ----------
+# Optional: raises Semantic Scholar's public rate limit (~100 req/5min unauthenticated).
+SEMANTIC_SCHOLAR_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
+DISCOVERY_HTTP_TIMEOUT_SECONDS = float(os.getenv("DISCOVERY_HTTP_TIMEOUT_SECONDS", "15"))
+# How many raw candidates to pull from Semantic Scholar before relevance filtering.
+DISCOVERY_SEARCH_POOL_SIZE = int(os.getenv("DISCOVERY_SEARCH_POOL_SIZE", "20"))
+DISCOVERY_FILTER_MAX_TOKENS = int(os.getenv("DISCOVERY_FILTER_MAX_TOKENS", "500"))
+# Default number of papers auto-ingested per discovery request.
+DISCOVERY_MAX_RESULTS = int(os.getenv("DISCOVERY_MAX_RESULTS", "5"))
+DISCOVERY_PDF_MAX_SIZE_MB = int(os.getenv("DISCOVERY_PDF_MAX_SIZE_MB", "25"))
