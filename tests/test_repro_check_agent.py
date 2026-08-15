@@ -392,6 +392,38 @@ class TestEvaluate:
         assert result["verdict"] == "Likely reproducible"
 
 
+class TestPrioritizedCodeExcerpt:
+    def test_returns_full_content_if_under_limit(self):
+        content = "def foo(): pass"
+        assert rca._prioritized_code_excerpt(content, 1000) == content
+
+    def test_prioritizes_function_bodies_over_module_level_boilerplate(self):
+        """Regression test for the real bug: mixup-cifar10's train.py has
+        ~4000 chars of argparse/setup before def mixup_data() -- a naive
+        content[:2000] prefix never reaches it, so the LLM correctly (and
+        misleadingly) reported no mixup implementation in what it was shown."""
+        boilerplate = "import argparse\n" + ("parser.add_argument('--x')\n" * 200)  # >2000 chars alone
+        content = boilerplate + "\ndef mixup_data(x, y, alpha=1.0):\n    lam = 1\n    return x, y, lam\n"
+        excerpt = rca._prioritized_code_excerpt(content, 500)
+        assert "def mixup_data" in excerpt
+        assert len(excerpt) <= 500 + 5  # small slack for the trailing partial-segment slice
+
+    def test_falls_back_to_prefix_when_no_functions_or_classes(self):
+        content = "x = 1\n" * 1000
+        excerpt = rca._prioritized_code_excerpt(content, 100)
+        assert excerpt == content[:100]
+
+    def test_falls_back_to_prefix_on_syntax_error(self):
+        content = "def broken(:\n" * 1000
+        excerpt = rca._prioritized_code_excerpt(content, 50)
+        assert excerpt == content[:50]
+
+    def test_multiple_functions_included_in_file_order(self):
+        content = "def a():\n    pass\n\ndef b():\n    pass\n\ndef c():\n    pass\n"
+        excerpt = rca._prioritized_code_excerpt(content, len(content) - 1)
+        assert excerpt.index("def a") < excerpt.index("def b")
+
+
 class TestSelectClaimCodeFiles:
     def test_prefers_shallow_paths(self):
         tree = ["src/deep/nested/model.py", "model.py"]

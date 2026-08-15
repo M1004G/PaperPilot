@@ -33,6 +33,7 @@ Checks that are informational rather than a real pass/fail signal (missing
 Dockerfile, missing CITATION file) are collected separately as `warnings`
 and excluded from scoring entirely, rather than silently shaping the number.
 """
+import ast
 import json
 import logging
 import os
@@ -445,6 +446,47 @@ def method_excerpt(paper: IngestedPaper) -> str:
     return text[:5000]
 
 
+def _prioritized_code_excerpt(content: str, max_chars: int) -> str:
+    """Real bug this fixes: naive `content[:max_chars]` truncation cut off a
+    file's actual implementation entirely when it was defined after
+    module-level setup code (imports, argparse, config) -- common in
+    research code, and confirmed directly against facebookresearch's
+    mixup-cifar10: mixup_data() doesn't start until character ~4100 of
+    train.py, well past a 2000-3000 char prefix, so the LLM reviewing that
+    prefix correctly reported seeing no mixup implementation -- it never saw
+    it. This spends the character budget on complete function/class bodies
+    first (in file order), not a blind prefix, so the algorithm itself is
+    what gets shown even when it's not the first thing in the file. Falls
+    back to a plain prefix if the file has no top-level functions/classes to
+    prioritize, or doesn't parse as valid Python."""
+    if len(content) <= max_chars:
+        return content
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return content[:max_chars]
+
+    defs = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+    if not defs:
+        return content[:max_chars]
+
+    segments = []
+    used = 0
+    for node in defs:
+        segment = ast.get_source_segment(content, node) or ""
+        if not segment:
+            continue
+        if used + len(segment) + 2 > max_chars:
+            remaining = max_chars - used - 2
+            if remaining > 100:  # only keep a partial segment if it's still meaningfully sized
+                segments.append(segment[:remaining])
+            break
+        segments.append(segment)
+        used += len(segment) + 2
+
+    return "\n\n".join(segments) if segments else content[:max_chars]
+
+
 _CODE_SIGNAL_NAME_HINTS = (
     "train", "main", "model", "method", "algorithm", "core", "loss", "run",
 )
@@ -490,7 +532,7 @@ def verify_claims(
     code_excerpts = code_excerpts or {}
     code_block = (
         "\n\n".join(
-            f"--- {name} ---\n{content[: config.REPRO_CLAIMS_CODE_FILE_CHARS]}"
+            f"--- {name} ---\n{_prioritized_code_excerpt(content, config.REPRO_CLAIMS_CODE_FILE_CHARS)}"
             for name, content in sorted(code_excerpts.items())
         )
         or "(no code excerpts available)"
@@ -561,7 +603,7 @@ def semantic_review(paper: IngestedPaper, py_files: dict[str, str], profile: str
         return {"coverage_score": None, "findings": []}
 
     code_excerpt = "\n\n".join(
-        f"--- {name} ---\n{content[:3000]}" for name, content in sorted(py_files.items())
+        f"--- {name} ---\n{_prioritized_code_excerpt(content, config.SEMANTIC_REVIEW_PER_FILE_CHARS)}" for name, content in sorted(py_files.items())
     )[: config.SEMANTIC_REVIEW_MAX_CODE_CHARS]
     code_label = "GENERATED CODE" if profile == "generated" else "CODE (excerpt -- a bounded subset of the repo's files, not the whole codebase)"
 
