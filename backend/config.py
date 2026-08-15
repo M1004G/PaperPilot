@@ -85,6 +85,12 @@ REPRO_RUFF_TIMEOUT_SECONDS = float(os.getenv("REPRO_RUFF_TIMEOUT_SECONDS", "10")
 SEMANTIC_REVIEW_ENABLED = os.getenv("SEMANTIC_REVIEW_ENABLED", "true").lower() == "true"
 SEMANTIC_REVIEW_MAX_TOKENS = int(os.getenv("SEMANTIC_REVIEW_MAX_TOKENS", "1000"))
 SEMANTIC_REVIEW_MAX_CODE_CHARS = int(os.getenv("SEMANTIC_REVIEW_MAX_CODE_CHARS", "12000"))
+# Per-file budget within that total -- was a hardcoded 3000 that silently
+# truncated from the top of the file, which can cut off a function defined
+# well after module-level setup code (imports/argparse/config). See
+# _prioritized_code_excerpt(): this budget is now spent on complete
+# function/class bodies first, not a blind character prefix.
+SEMANTIC_REVIEW_PER_FILE_CHARS = int(os.getenv("SEMANTIC_REVIEW_PER_FILE_CHARS", "3000"))
 
 # ---------- Codegen Agent ----------
 # Runs when no repo is linked/found for a paper: extracts structured methodology
@@ -104,8 +110,7 @@ CODEGEN_MAX_FILES = int(os.getenv("CODEGEN_MAX_FILES", "8"))
 # response rather than real output (see codegen_agent._looks_like_refusal_or_empty).
 CODEGEN_MIN_FILE_CHARS = int(os.getenv("CODEGEN_MIN_FILE_CHARS", "20"))
 
-# ---------- Discovery Agent ----------
-# Optional: raises Semantic Scholar's public rate limit (~100 req/5min unauthenticated).
+# ---------- Discovery Agent ----------# Optional: raises Semantic Scholar's public rate limit (~100 req/5min unauthenticated).
 SEMANTIC_SCHOLAR_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
 DISCOVERY_HTTP_TIMEOUT_SECONDS = float(os.getenv("DISCOVERY_HTTP_TIMEOUT_SECONDS", "15"))
 # How many raw candidates to pull from Semantic Scholar before relevance filtering.
