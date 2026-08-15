@@ -265,6 +265,23 @@ class TestVerifyClaims:
         monkeypatch.setattr(fake_llm, "complete_json", lambda *a, **k: "not json")
         assert rca.verify_claims(paper, tree=[], readme_content=None) == []
 
+    def test_code_excerpts_are_included_in_prompt(self, fake_llm, monkeypatch):
+        captured = {}
+
+        def fake_complete(system, prompt, **kwargs):
+            captured["prompt"] = prompt
+            return json.dumps({"claims": []})
+
+        monkeypatch.setattr(fake_llm, "complete_json", fake_complete)
+        paper = make_paper(method_text="We train a model.")
+        rca.verify_claims(paper, tree=["train.py"], readme_content="# X", code_excerpts={"train.py": "def train(): pass"})
+        assert "def train(): pass" in captured["prompt"]
+
+    def test_no_code_excerpts_still_works(self, fake_llm, monkeypatch):
+        monkeypatch.setattr(fake_llm, "complete_json", lambda *a, **k: json.dumps({"claims": []}))
+        paper = make_paper(method_text="We train a model.")
+        assert rca.verify_claims(paper, tree=["train.py"], readme_content="# X") == []
+
 
 class TestSemanticReview:
     def test_no_method_text_returns_none_score(self, fake_llm):
@@ -324,12 +341,113 @@ class TestEvaluate:
         assert set(result.keys()) == {"checks", "warnings", "score", "category_scores", "verdict", "claims", "semantic_findings"}
         assert isinstance(result["score"], int)
 
-    def test_repo_profile_has_no_semantic_findings(self, fake_llm, monkeypatch):
+    def test_repo_profile_also_runs_semantic_review(self, fake_llm, monkeypatch):
+        """This is the direct fix for the reported bug: a repo with real code
+        but a terse README should no longer be judged only on file
+        tree/README -- semantic_review now runs for profile="repo" too,
+        using actual code content."""
         monkeypatch.setattr(rca, "verify_claims", lambda *a, **k: [])
-        paper = make_paper()
-        result = rca.evaluate(paper, ["README.md"], lambda p: "# X", metadata=GOOD_METADATA, profile="repo")
-        assert result["semantic_findings"] == []
-        assert "semantic_review" not in {c["id"] for c in result["checks"]}
+        monkeypatch.setattr(fake_llm, "complete_json", lambda *a, **k: json.dumps({"coverage_score": 85, "findings": []}))
+        files = {"README.md": "# X", "train.py": "def train():\n    pass"}
+        paper = make_paper(method_text="We train a model.")
+        result = rca.evaluate(paper, sorted(files.keys()), files.get, metadata=GOOD_METADATA, profile="repo")
+        assert any(c["id"] == "semantic_review" for c in result["checks"])
+
+    def test_semantic_review_weight_dominates_repo_profile_score(self):
+        assert rca._REPO_CHECK_WEIGHTS["semantic_review"] == 70
+        assert rca._REPO_CHECK_WEIGHTS["has_license"] == 0
+        assert rca._REPO_CHECK_WEIGHTS["has_ci"] == 0
+
+    def test_mixup_style_repo_scores_well_when_code_actually_implements_method(self, fake_llm, monkeypatch):
+        """Regression test modeling the reported bug: a real repo (terse
+        README, no test suite, no CI, archived) whose code genuinely
+        implements the paper's method should NOT score near 0 just because
+        claim verification only had README/file-tree evidence to work with.
+        Semantic review, given the actual code, should recognize the real
+        implementation and dominate the score."""
+        monkeypatch.setattr(rca, "verify_claims", lambda *a, **k: [
+            {"claim": "trains on convex combinations of examples", "verdict": "not_evident", "evidence": "no supporting file/README evidence"},
+        ])
+        monkeypatch.setattr(fake_llm, "complete_json", lambda *a, **k: json.dumps({
+            "coverage_score": 90,
+            "findings": [{"severity": "low", "issue": "Minor: no explicit alpha validation.", "location": "train.py"}],
+        }))
+        files = {
+            "README.md": "# mixup-cifar10",
+            "train.py": (
+                "import numpy as np\n\n"
+                "def mixup_data(x, y, alpha):\n"
+                "    lam = np.random.beta(alpha, alpha)\n"
+                "    index = np.random.permutation(x.size(0))\n"
+                "    mixed_x = lam * x + (1 - lam) * x[index]\n"
+                "    return mixed_x, y, y[index], lam\n"
+            ),
+        }
+        metadata = {**GOOD_METADATA, "archived": True, "license_spdx_id": None, "license_name": None}
+        paper = make_paper(method_text="We train a neural network on convex combinations of pairs of examples and their labels.")
+        result = rca.evaluate(paper, sorted(files.keys()), files.get, metadata=metadata, profile="repo")
+        # Archived status, missing license, no tests/CI no longer crush the
+        # score -- they're informational warnings now, not scored deductions.
+        assert result["score"] >= 70
+        assert result["verdict"] == "Likely reproducible"
+
+
+class TestPrioritizedCodeExcerpt:
+    def test_returns_full_content_if_under_limit(self):
+        content = "def foo(): pass"
+        assert rca._prioritized_code_excerpt(content, 1000) == content
+
+    def test_prioritizes_function_bodies_over_module_level_boilerplate(self):
+        """Regression test for the real bug: mixup-cifar10's train.py has
+        ~4000 chars of argparse/setup before def mixup_data() -- a naive
+        content[:2000] prefix never reaches it, so the LLM correctly (and
+        misleadingly) reported no mixup implementation in what it was shown."""
+        boilerplate = "import argparse\n" + ("parser.add_argument('--x')\n" * 200)  # >2000 chars alone
+        content = boilerplate + "\ndef mixup_data(x, y, alpha=1.0):\n    lam = 1\n    return x, y, lam\n"
+        excerpt = rca._prioritized_code_excerpt(content, 500)
+        assert "def mixup_data" in excerpt
+        assert len(excerpt) <= 500 + 5  # small slack for the trailing partial-segment slice
+
+    def test_falls_back_to_prefix_when_no_functions_or_classes(self):
+        content = "x = 1\n" * 1000
+        excerpt = rca._prioritized_code_excerpt(content, 100)
+        assert excerpt == content[:100]
+
+    def test_falls_back_to_prefix_on_syntax_error(self):
+        content = "def broken(:\n" * 1000
+        excerpt = rca._prioritized_code_excerpt(content, 50)
+        assert excerpt == content[:50]
+
+    def test_multiple_functions_included_in_file_order(self):
+        content = "def a():\n    pass\n\ndef b():\n    pass\n\ndef c():\n    pass\n"
+        excerpt = rca._prioritized_code_excerpt(content, len(content) - 1)
+        assert excerpt.index("def a") < excerpt.index("def b")
+
+
+class TestSelectClaimCodeFiles:
+    def test_prefers_shallow_paths(self):
+        tree = ["src/deep/nested/model.py", "model.py"]
+        assert rca._select_claim_code_files(tree)[0] == "model.py"
+
+    def test_prefers_method_signal_filenames(self):
+        tree = ["utils.py", "train.py"]
+        selected = rca._select_claim_code_files(tree)
+        assert selected[0] == "train.py"
+
+    def test_excludes_test_files(self):
+        tree = ["tests/test_model.py", "test_utils.py", "model.py"]
+        selected = rca._select_claim_code_files(tree)
+        assert "tests/test_model.py" not in selected
+        assert "test_utils.py" not in selected
+
+    def test_respects_max_files_config(self, monkeypatch):
+        from backend import config
+        monkeypatch.setattr(config, "REPRO_CLAIMS_MAX_CODE_FILES", 2)
+        tree = ["a.py", "b.py", "c.py", "d.py"]
+        assert len(rca._select_claim_code_files(tree)) == 2
+
+    def test_no_py_files_returns_empty(self):
+        assert rca._select_claim_code_files(["README.md", "requirements.txt"]) == []
 
     def test_generated_profile_runs_semantic_review(self, fake_llm, monkeypatch):
         monkeypatch.setattr(rca, "verify_claims", lambda *a, **k: [])
