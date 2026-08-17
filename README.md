@@ -2,7 +2,6 @@
 
 Multi-agent research assistant that ingests a research paper PDF and produces a structured summary, gap analysis, retrieval-augmented Q&A, and an automated code reproducibility assessment.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for system design details.
 
 ## Features
 
