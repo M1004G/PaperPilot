@@ -10,9 +10,9 @@ def build_report(
     gaps: dict,
     repro: dict | None = None,
 ) -> str:
-    lines = [f"# {paper.title}", ""]
+    lines = [f"# {paper.title}", ""] #The # at the front is Markdown syntax for "this is a heading."
 
-    lines += ["## Concise Overview", tldr, ""]
+    lines += ["## Concise Overview", tldr, ""] 
 
     lines += ["## Key Findings"]
     for f in key_findings:
