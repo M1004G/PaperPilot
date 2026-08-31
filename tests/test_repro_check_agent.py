@@ -485,3 +485,125 @@ class TestSelectClaimCodeFiles:
         assert "has_citation_file" not in check_ids
         assert "has_dockerfile_or_env_spec" in warning_ids
         assert "has_citation_file" in warning_ids
+
+
+class TestSelectClaimCodeFilesPaperSpecific:
+    """Regression tests for the confirmed Cutout/SAM bug: paper-specific
+    method files (named after the technique itself, not a generic term)
+    were never selected."""
+
+    def _cutout_paper(self):
+        return IngestedPaper(
+            title="Improved Regularization of Convolutional Neural Networks with Cutout",
+            abstract="", sections=[], full_text="",
+        )
+
+    def test_paper_specific_filename_beats_generic_hints(self):
+        """Exact tree from the confirmed bug report against
+        uoguelph-mlrg/Cutout: util/cutout.py contains the entire method and
+        must be selected; the old version picked train.py/model/__init__.py/
+        model/resnet.py instead and never selected it at all."""
+        tree = [
+            "train.py", "model/__init__.py", "model/resnet.py",
+            "model/wide_resnet.py", "util/__init__.py", "util/cutout.py", "util/misc.py",
+        ]
+        selected = rca._select_claim_code_files(tree, self._cutout_paper())
+        assert "util/cutout.py" in selected
+        assert selected[0] == "util/cutout.py"  # paper-specific match ranks first
+
+    def test_dunder_files_deprioritized_below_everything_else(self):
+        """model/__init__.py must not win purely on alphabetical ordering
+        against a real (if unhinted) implementation file."""
+        tree = ["model/__init__.py", "model/resnet.py"]
+        selected = rca._select_claim_code_files(tree, self._cutout_paper())
+        assert selected[0] == "model/resnet.py"
+
+    def test_no_paper_falls_back_to_generic_hints_only(self):
+        tree = ["util/cutout.py", "train.py"]
+        selected = rca._select_claim_code_files(tree, paper=None)
+        assert selected[0] == "train.py"  # generic hint, since no paper to derive from
+
+    def test_depth_does_not_bias_selection(self):
+        """Regression for the SAM case: a deeper, actually-relevant file
+        must not lose to a shallower irrelevant one just for being shallower.
+        Paper title includes the acronym in parens, as real papers virtually
+        always do on first mention -- token derivation is title-text-only
+        (see _paper_keyword_tokens), so an acronym absent from the title
+        entirely is a known, documented limitation, not this bug."""
+        paper = IngestedPaper(title="Sharpness-Aware Minimization (SAM) for Efficiently Improving Generalization", abstract="", sections=[], full_text="")
+        tree = ["a_shallow_unrelated_file.py", "deep/nested/pkg/sam.py"]
+        selected = rca._select_claim_code_files(tree, paper)
+        assert selected[0] == "deep/nested/pkg/sam.py"
+
+    def test_generic_title_words_are_not_treated_as_method_names(self):
+        """'network', 'deep', 'model' etc. in a title shouldn't cause
+        unrelated generically-named files to jump to tier 0."""
+        paper = IngestedPaper(title="A Deep Neural Network Model for Improved Learning", abstract="", sections=[], full_text="")
+        tokens = rca._paper_keyword_tokens(paper)
+        assert tokens == set()  # every word in that title is a stopword
+
+
+class TestFindManifestPathVendorExclusion:
+    def test_excludes_vendored_setup_py(self):
+        """Regression for the confirmed Random Erasing bug: a bundled
+        third-party library's setup.py must not be picked as the project's
+        own dependency manifest."""
+        tree = ["vendor/some_lib/setup.py", "requirements.txt"]
+        assert rca.find_manifest_path(tree) == "requirements.txt"
+
+    def test_excludes_third_party_dir_variants(self):
+        for vendor_dir in ("third_party", "thirdparty", "external", "node_modules", "site-packages"):
+            tree = [f"{vendor_dir}/lib/setup.py"]
+            assert rca.find_manifest_path(tree) is None
+
+    def test_returns_none_if_only_vendored_manifest_exists(self):
+        assert rca.find_manifest_path(["vendor/lib/requirements.txt"]) is None
+
+    def test_still_prefers_root_over_nested_non_vendor(self):
+        tree = ["examples/requirements.txt", "requirements.txt"]
+        assert rca.find_manifest_path(tree) == "requirements.txt"
+
+
+class TestPrioritizedCodeExcerptClassMethods:
+    """Regression tests for the confirmed Lookahead bug: a class exceeding
+    the per-file budget used to fall back to raw prefix-truncation of the
+    whole class, cutting off later methods (e.g. step()) entirely."""
+
+    LOOKAHEAD_LIKE = (
+        "import torch\n\n"
+        "class Lookahead:\n"
+        "    def __init__(self, optimizer, k=5, alpha=0.5):\n"
+        "        self.optimizer = optimizer\n"
+        "        self.k = k\n\n"
+        "    def step(self, closure=None):\n"
+        "        loss = self.optimizer.step(closure)\n"
+        "        return loss\n\n"
+        "    def zero_grad(self):\n"
+        "        self.optimizer.zero_grad()\n"
+    )
+
+    def test_class_broken_into_individual_complete_methods(self):
+        import ast as _ast
+        segments = rca._flatten_prioritizable_segments(_ast.parse(self.LOOKAHEAD_LIKE), self.LOOKAHEAD_LIKE)
+        assert len(segments) == 3  # __init__, step, zero_grad as separate segments
+        assert all("def " in s for s in segments)
+
+    def test_later_method_survives_truncation_when_it_fits(self):
+        budget = len(self.LOOKAHEAD_LIKE) - 20  # forces truncation, but all 3 methods still fit
+        excerpt = rca._prioritized_code_excerpt(self.LOOKAHEAD_LIKE, budget)
+        assert "def step" in excerpt and "return loss" in excerpt
+
+    def test_first_method_survives_a_tight_budget_intact(self):
+        # first segment (comment prefix + __init__ source) is exactly 130 chars --
+        # 150 is tight but sufficient to hold it whole, per the design's own
+        # rule of only keeping a segment complete when it actually fits.
+        excerpt = rca._prioritized_code_excerpt(self.LOOKAHEAD_LIKE, 150)
+        assert "def __init__(self, optimizer, k=5, alpha=0.5):" in excerpt
+        assert "self.k = k" in excerpt
+
+    def test_class_with_no_methods_falls_back_to_full_source(self):
+        import ast as _ast
+        content = "class Config:\n    x = 1\n    y = 2\n"
+        segments = rca._flatten_prioritizable_segments(_ast.parse(content), content)
+        assert len(segments) == 1
+        assert "class Config" in segments[0]

@@ -37,6 +37,7 @@ import ast
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -166,17 +167,33 @@ class CheckResult:
     category: str = "correctness"
 
 
+_VENDOR_DIR_MARKERS = {
+    "vendor", "vendored", "third_party", "thirdparty", "external", "extern",
+    "deps", "node_modules", "site-packages", ".venv", "venv",
+}
+
+
 def find_manifest_path(tree: list[str]) -> str | None:
     """First dependency manifest found, preferring root-level files over
-    ones buried in subdirectories (a manifest in examples/ or a vendored
-    dependency isn't the project's real one)."""
-    by_depth = sorted(tree, key=lambda p: p.count("/"))
+    ones buried in subdirectories (a manifest in examples/ isn't the
+    project's real one). Vendored/third-party copies are excluded outright,
+    not just deprioritized -- a bundled dependency's own setup.py has
+    nothing to do with what THIS project depends on, and depth-sorting
+    alone doesn't stop a vendored manifest from being picked when it's
+    shallower than (or ties with) the real one."""
     names = {name.lower(): name for name in DEPENDENCY_MANIFESTS}
-    for path in by_depth:
+    candidates = []
+    for path in tree:
         filename = path.rsplit("/", 1)[-1]
-        if filename in DEPENDENCY_MANIFESTS or filename.lower() in names:
-            return path
-    return None
+        if filename not in DEPENDENCY_MANIFESTS and filename.lower() not in names:
+            continue
+        dir_segments = {seg.lower() for seg in path.split("/")[:-1]}
+        if dir_segments & _VENDOR_DIR_MARKERS:
+            continue
+        candidates.append(path)
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda p: p.count("/"))[0]
 
 
 def find_readme_path(tree: list[str]) -> str | None:
@@ -446,6 +463,33 @@ def method_excerpt(paper: IngestedPaper) -> str:
     return text[:5000]
 
 
+def _flatten_prioritizable_segments(tree: ast.Module, content: str) -> list[str]:
+    """Complete, self-contained source units to prioritize: top-level
+    functions as-is, and classes broken into one segment PER METHOD (not
+    kept as one atomic block) -- so truncation always cuts between complete
+    functions/methods, never mid-method. A class with no methods (rare --
+    e.g. a plain dataclass-style container) falls back to its full source
+    as one segment, since there's nothing smaller to break it into."""
+    segments = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            src = ast.get_source_segment(content, node)
+            if src:
+                segments.append(src)
+        elif isinstance(node, ast.ClassDef):
+            methods = [n for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+            if not methods:
+                src = ast.get_source_segment(content, node)
+                if src:
+                    segments.append(src)
+                continue
+            for method in methods:
+                src = ast.get_source_segment(content, method)
+                if src:
+                    segments.append(f"# (method of class {node.name})\n{src}")
+    return segments
+
+
 def _prioritized_code_excerpt(content: str, max_chars: int) -> str:
     """Real bug this fixes: naive `content[:max_chars]` truncation cut off a
     file's actual implementation entirely when it was defined after
@@ -454,11 +498,21 @@ def _prioritized_code_excerpt(content: str, max_chars: int) -> str:
     mixup-cifar10: mixup_data() doesn't start until character ~4100 of
     train.py, well past a 2000-3000 char prefix, so the LLM reviewing that
     prefix correctly reported seeing no mixup implementation -- it never saw
-    it. This spends the character budget on complete function/class bodies
+    it. This spends the character budget on complete function/method units
     first (in file order), not a blind prefix, so the algorithm itself is
-    what gets shown even when it's not the first thing in the file. Falls
-    back to a plain prefix if the file has no top-level functions/classes to
-    prioritize, or doesn't parse as valid Python."""
+    what gets shown even when it's not the first thing in the file.
+
+    A class is NOT treated as one atomic unit -- an earlier version did
+    that and hit the same failure mode one level down: confirmed against a
+    Lookahead-optimizer implementation, where the entire method lived in
+    one class, and a class exceeding the per-file budget fell back to
+    raw-prefix-truncating the class body, cutting off methods defined later
+    (e.g. step()) exactly like the original bug. Classes are now flattened
+    into one segment per method (see _flatten_prioritizable_segments), so
+    truncation always drops whole trailing methods, never cuts one in half.
+
+    Falls back to a plain prefix if the file has no top-level functions/
+    classes to prioritize, or doesn't parse as valid Python."""
     if len(content) <= max_chars:
         return content
     try:
@@ -466,47 +520,107 @@ def _prioritized_code_excerpt(content: str, max_chars: int) -> str:
     except SyntaxError:
         return content[:max_chars]
 
-    defs = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
-    if not defs:
+    segments = _flatten_prioritizable_segments(tree, content)
+    if not segments:
         return content[:max_chars]
 
-    segments = []
+    included = []
     used = 0
-    for node in defs:
-        segment = ast.get_source_segment(content, node) or ""
-        if not segment:
-            continue
+    for segment in segments:
         if used + len(segment) + 2 > max_chars:
             remaining = max_chars - used - 2
             if remaining > 100:  # only keep a partial segment if it's still meaningfully sized
-                segments.append(segment[:remaining])
+                included.append(segment[:remaining])
             break
-        segments.append(segment)
+        included.append(segment)
         used += len(segment) + 2
 
-    return "\n\n".join(segments) if segments else content[:max_chars]
+    return "\n\n".join(included) if included else content[:max_chars]
 
 
 _CODE_SIGNAL_NAME_HINTS = (
     "train", "main", "model", "method", "algorithm", "core", "loss", "run",
 )
 
+# Generic words common in paper titles -- excluded when deriving paper-specific
+# filename keywords below, since treating these as "the technique's name"
+# would false-positive on almost any file (e.g. "network", "deep", "improved").
+_TITLE_STOPWORDS = {
+    "the", "and", "for", "with", "using", "via", "based", "improved", "improving",
+    "novel", "new", "toward", "towards", "study", "analysis", "approach", "approaches",
+    "method", "methods", "model", "models", "network", "networks", "neural", "deep",
+    "learning", "training", "regularization", "convolutional", "framework", "system",
+    "efficient", "robust", "simple", "generalization", "understanding", "revisiting",
+}
 
-def _select_claim_code_files(tree: list[str]) -> list[str]:
+
+def _paper_keyword_tokens(paper: IngestedPaper) -> set[str]:
+    """Candidate filename keywords derived from the paper's own title.
+    Academic implementations are very often named after the paper's own
+    coined term for its technique (cutout.py, mixup.py, lookahead.py,
+    sam.py) -- a fixed generic hint list can never anticipate that, since
+    it's different for every paper. Returns an empty set (graceful, no
+    crash) if the title yields nothing usable after stopword filtering.
+
+    Known limitation: derived from the title only, not the abstract or
+    body. A paper whose title doesn't spell out an acronym used as the
+    method's actual name (uncommon -- most papers include it in parens on
+    first mention, e.g. "Sharpness-Aware Minimization (SAM)") won't surface
+    that acronym as a keyword. Not fixed here to keep this deliberately
+    narrow in scope and cheap (one field, no extra parsing); worth widening
+    to the abstract if this proves to matter in practice."""
+    tokens = re.findall(r"[a-zA-Z]{3,}", (paper.title or "").lower())
+    return {t for t in tokens if t not in _TITLE_STOPWORDS}
+
+
+def _select_claim_code_files(tree: list[str], paper: IngestedPaper = None) -> list[str]:
     """Pick a small, bounded set of .py files likely to contain the actual
-    method implementation, for claim verification to actually read. Not
-    exhaustive (see repo_fetch.py's cost tradeoff) -- just enough that a
-    terse-README repo isn't judged on filenames alone.
+    method implementation, for claim verification/semantic review to
+    actually read. Not exhaustive (see repo_fetch.py's cost tradeoff) --
+    just enough that a terse-README repo isn't judged on filenames alone.
 
-    Preference order: shallow path depth, then filename matches a
-    method-signal keyword, then first-seen order (deterministic)."""
+    Fixes a real, confirmed failure mode: against uoguelph-mlrg/Cutout's
+    tree (train.py, model/__init__.py, model/resnet.py, model/wide_resnet.py,
+    util/cutout.py, util/misc.py), the previous version picked
+    ['train.py', 'model/__init__.py', 'model/resnet.py'] -- util/cutout.py,
+    which contains the ENTIRE method implementation, was never selected,
+    and semantic_review then reported the method as missing from a repo
+    that actually implements it correctly. Two causes, both fixed here:
+    1. The old hint list (train/main/model/...) is generic and will never
+       contain a specific paper's own coined term for its technique.
+    2. The old tiebreak fell back to alphabetical order with no penalty for
+       near-empty files -- `model/__init__.py` beat `util/cutout.py` purely
+       because 'm' < 'u'.
+
+    Ranking, most to least preferred:
+    0. filename contains a keyword derived from the paper's own title
+    1. filename contains a generic implementation-signal keyword (train/main/...)
+    2. everything else
+    3. __init__.py / __main__.py -- near-empty package boilerplate, actively
+       deprioritized rather than left to alphabetical chance
+
+    Directory depth is deliberately NOT part of the ranking -- a shallow
+    entry-point script isn't more likely to contain the actual method than
+    a file one directory deeper, and repos that deliberately organize core
+    algorithm logic into a subpackage (a common, sensible pattern) were
+    previously penalized for it. Within a tier, ties break alphabetically."""
     py_files = [p for p in tree if p.endswith(".py") and "/test" not in p.lower() and not p.lower().startswith("test")]
+    paper_tokens = _paper_keyword_tokens(paper) if paper is not None else set()
 
-    def sort_key(path: str) -> tuple[int, int, str]:
-        depth = path.count("/")
+    def sort_key(path: str) -> tuple[int, str]:
         name = path.rsplit("/", 1)[-1].lower()
-        has_hint = 0 if any(hint in name for hint in _CODE_SIGNAL_NAME_HINTS) else 1
-        return (depth, has_hint, path)
+        stem = name[:-3] if name.endswith(".py") else name
+
+        if stem in ("__init__", "__main__"):
+            tier = 3
+        elif paper_tokens and any(tok in stem for tok in paper_tokens):
+            tier = 0
+        elif any(hint in stem for hint in _CODE_SIGNAL_NAME_HINTS):
+            tier = 1
+        else:
+            tier = 2
+
+        return (tier, path)
 
     return sorted(py_files, key=sort_key)[: config.REPRO_CLAIMS_MAX_CODE_FILES]
 
@@ -561,7 +675,7 @@ Respond with ONLY a JSON object of this exact shape, no other text:
 {{"claims": [
   {{"claim": "<one-sentence claim from the paper>", "verdict": "matches|unclear|not_evident", "evidence": "<short reason citing a file/README/code detail, or 'no supporting evidence'>"}}
 ]}}"""
-    raw = llm_client.complete_json(CLAIM_SYSTEM_PROMPT, prompt, max_tokens=600)
+    raw = llm_client.complete_json(CLAIM_SYSTEM_PROMPT, prompt, max_tokens=config.REPRO_CLAIMS_MAX_TOKENS)
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
@@ -674,7 +788,7 @@ def evaluate(paper: IngestedPaper, tree: list[str], get_content: GetContent, met
     # avoids two separate GitHub fetch passes over the same files.
     code_excerpts: dict[str, str] = {}
     if profile == "repo":
-        for path in _select_claim_code_files(tree):
+        for path in _select_claim_code_files(tree, paper):
             content = get_content(path)
             if content:
                 code_excerpts[path] = content

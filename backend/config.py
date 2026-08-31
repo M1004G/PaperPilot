@@ -20,7 +20,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 # ---------- LLM provider (Groq) ----------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 # Groq free tier is rate-limited (~30 RPM / 6000 TPM depending on model), not just
 # a credits budget, so calls need retry/backoff and bounded concurrency baked in.
@@ -76,6 +76,10 @@ REPRO_LLM_CLAIMS_ENABLED = os.getenv("REPRO_LLM_CLAIMS_ENABLED", "true").lower()
 # from failing every check by construction on terse-README repos.
 REPRO_CLAIMS_MAX_CODE_FILES = int(os.getenv("REPRO_CLAIMS_MAX_CODE_FILES", "3"))
 REPRO_CLAIMS_CODE_FILE_CHARS = int(os.getenv("REPRO_CLAIMS_CODE_FILE_CHARS", "2000"))
+# Was a hardcoded 600 in verify_claims() -- same truncation problem as
+# SEMANTIC_REVIEW_MAX_TOKENS above (reasoning models eat into this budget
+# before writing the actual JSON), just not yet made configurable.
+REPRO_CLAIMS_MAX_TOKENS = int(os.getenv("REPRO_CLAIMS_MAX_TOKENS", "2000"))
 # Timeout for each ruff subprocess call in the generated-code static analysis
 # check (repro_check_agent._run_ruff_on_file) -- one call per .py file.
 REPRO_RUFF_TIMEOUT_SECONDS = float(os.getenv("REPRO_RUFF_TIMEOUT_SECONDS", "10"))
@@ -83,7 +87,14 @@ REPRO_RUFF_TIMEOUT_SECONDS = float(os.getenv("REPRO_RUFF_TIMEOUT_SECONDS", "10")
 # against the paper for missing steps / hallucinated APIs / shape mismatches
 # -- deeper than the file-tree-only claim verification above.
 SEMANTIC_REVIEW_ENABLED = os.getenv("SEMANTIC_REVIEW_ENABLED", "true").lower() == "true"
-SEMANTIC_REVIEW_MAX_TOKENS = int(os.getenv("SEMANTIC_REVIEW_MAX_TOKENS", "1000"))
+# 3000, not a smaller "should be plenty for JSON" number -- confirmed directly
+# against a real run: reasoning models (e.g. openai/gpt-oss-120b) spend part
+# of the completion budget on hidden reasoning tokens before writing the
+# actual JSON answer, so a tight ceiling here doesn't just risk a long
+# answer, it risks the JSON never finishing at all. A 1000-token budget was
+# observed being hit exactly (completion_tokens=1000) with a truncated,
+# unparseable response every time.
+SEMANTIC_REVIEW_MAX_TOKENS = int(os.getenv("SEMANTIC_REVIEW_MAX_TOKENS", "3000"))
 SEMANTIC_REVIEW_MAX_CODE_CHARS = int(os.getenv("SEMANTIC_REVIEW_MAX_CODE_CHARS", "12000"))
 # Per-file budget within that total -- was a hardcoded 3000 that silently
 # truncated from the top of the file, which can cut off a function defined
