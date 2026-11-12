@@ -130,8 +130,7 @@ Respond with ONLY a JSON object of exactly this shape, no other text:
 
 def download_pdf(url: str) -> str | None:
     """Downloads one candidate's PDF to a temp file, bounded by size and
-    timeout, with a content-type check -- the same defensive shape as
-    repo_fetch.py's file access, since this is also fetching content from an
+    timeout, with a content-type check -- defensive because this fetches content from an
     untrusted external URL. Returns None (not an exception) on any failure:
     one broken PDF link shouldn't abort an entire discovery batch."""
     try:

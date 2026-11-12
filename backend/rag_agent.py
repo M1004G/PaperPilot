@@ -9,9 +9,8 @@ retry/backoff and rate-limit handling for Groq's free tier.
 
 Each document gets its own persistent Chroma collection (data/chroma/,
 collection name derived from doc_id), so a server restart reuses the
-already-embedded vectors instead of re-embedding chunk text from scratch --
-unlike the previous FAISS-based version, which held vectors in memory only
-and rebuilt them from persisted chunk text on every load. Each chunk carries
+already-embedded vectors instead of re-embedding chunk text from scratch.
+Each chunk carries
 section heading + page metadata, so the LLM can ground answers in "where
 this came from" rather than an anonymous blob of text.
 """
