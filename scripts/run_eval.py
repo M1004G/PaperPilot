@@ -35,6 +35,8 @@ def main():
     parser.add_argument("--doc-id", help="Reuse an already-ingested doc_id (skips parsing + LLM generation)")
     parser.add_argument("--questions", help="Optional JSON file of {question, expected_keywords} test cases")
     parser.add_argument("--report-out", help="Optional path to write the full JSON report")
+    parser.add_argument("--skip-faithfulness", action="store_true",
+                        help="Skip the summary + gap faithfulness judging (saves many LLM calls)")
     args = parser.parse_args()
     if not args.pdf_path and not args.doc_id:
         parser.error("provide a pdf_path or --doc-id")
@@ -72,18 +74,23 @@ def main():
 
     session = orch.sessions[doc_id]
 
-    _print_header("FAITHFULNESS EVAL (summary)")
-    summary_eval = eval_agent.evaluate_summary(session.paper, summary)
-    print(f"TL;DR faithfulness: {summary_eval['tldr']}")
-    for s in summary_eval["section_summaries"]:
-        flag = " ⚠️" if s["score"] and s["score"] < 4 else ""
-        print(f"  [{s['label']}] score={s['score']}{flag} — {s['reasoning']}")
+    if args.skip_faithfulness:
+        summary_eval = {"tldr": None, "section_summaries": []}
+        gaps_eval = {"inferred_gaps": []}
+        print("\n(--skip-faithfulness: skipping summary + gap faithfulness eval)")
+    else:
+        _print_header("FAITHFULNESS EVAL (summary)")
+        summary_eval = eval_agent.evaluate_summary(session.paper, summary)
+        print(f"TL;DR faithfulness: {summary_eval['tldr']}")
+        for s in summary_eval["section_summaries"]:
+            flag = " ⚠️" if s["score"] and s["score"] < 4 else ""
+            print(f"  [{s['label']}] score={s['score']}{flag} — {s['reasoning']}")
 
-    _print_header("FAITHFULNESS EVAL (gaps)")
-    gaps_eval = eval_agent.evaluate_gaps(session.paper, gaps)
-    for g in gaps_eval["inferred_gaps"]:
-        flag = " ⚠️" if g["score"] and g["score"] < 4 else ""
-        print(f"  score={g['score']}{flag} — {g['reasoning']}")
+        _print_header("FAITHFULNESS EVAL (gaps)")
+        gaps_eval = eval_agent.evaluate_gaps(session.paper, gaps)
+        for g in gaps_eval["inferred_gaps"]:
+            flag = " ⚠️" if g["score"] and g["score"] < 4 else ""
+            print(f"  score={g['score']}{flag} — {g['reasoning']}")
 
     qa_results = []
     retrieval_report = None
@@ -98,6 +105,10 @@ def main():
 
         _print_header("CHAT ANSWER FAITHFULNESS")
         for case in test_cases:
+            # Each eval question must be answered independently: clear any chat
+            # history (including turns persisted from earlier runs on this doc_id)
+            # so earlier answers don't leak into later ones or inflate the prompt.
+            session.chat_history.clear()
             result = orch.chat(doc_id, case["question"])
             qa_results.append({"question": case["question"], **result})
         chat_eval = eval_agent.evaluate_chat_answers(session.rag_index, qa_results)
@@ -110,7 +121,8 @@ def main():
 
     _print_header("SUMMARY")
     overall = eval_agent.summarize_scores(
-        [summary_eval["tldr"]], summary_eval["section_summaries"], gaps_eval["inferred_gaps"], chat_eval
+        [summary_eval["tldr"]] if summary_eval["tldr"] else [],
+        summary_eval["section_summaries"], gaps_eval["inferred_gaps"], chat_eval,
     )
     print(f"Average faithfulness score across {overall['count']} judged items: {overall['average']}")
     if retrieval_report and retrieval_report["hit_rate"] is not None:
