@@ -43,9 +43,14 @@ Summarize this section in 2-3 sentences, capturing only its key claims/content."
 
 
 def section_summaries(paper: IngestedPaper) -> list[dict]:
+    # Skip non-content sections and junk "sections" produced by heading detection on
+    # math/pseudocode (e.g. "X", "T", "while θt not converged do").
     sections = [
         s for s in paper.sections
         if s.heading.lower() not in ("references", "acknowledgments", "acknowledgements")
+        and len(s.text) > 600
+        and sum(c.isalpha() for c in s.heading) >= 4
+        and not s.heading.lower().startswith(("while", "return", "require"))
     ]
     if not sections:
         return []

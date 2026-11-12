@@ -31,10 +31,13 @@ def _print_header(title: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Run PaperPilot end-to-end and report quality.")
-    parser.add_argument("pdf_path", help="Path to a research paper PDF")
+    parser.add_argument("pdf_path", nargs="?", help="Path to a research paper PDF")
+    parser.add_argument("--doc-id", help="Reuse an already-ingested doc_id (skips parsing + LLM generation)")
     parser.add_argument("--questions", help="Optional JSON file of {question, expected_keywords} test cases")
     parser.add_argument("--report-out", help="Optional path to write the full JSON report")
     args = parser.parse_args()
+    if not args.pdf_path and not args.doc_id:
+        parser.error("provide a pdf_path or --doc-id")
 
     test_cases = []
     if args.questions:
@@ -44,8 +47,18 @@ def main():
     orch = Orchestrator()
 
     _print_header("INGESTING")
-    ingest_result = orch.ingest_paper(args.pdf_path)
-    doc_id = ingest_result["doc_id"]
+    if args.doc_id:
+        if args.doc_id not in orch.sessions:
+            sys.exit(f"Unknown doc_id {args.doc_id}. Known: {list(orch.sessions)}")
+        doc_id = args.doc_id
+        p = orch.sessions[doc_id].paper
+        ingest_result = {
+            "doc_id": doc_id, "title": p.title, "num_pages": p.num_pages,
+            "sections": [s.heading for s in p.sections],
+        }
+    else:
+        ingest_result = orch.ingest_paper(args.pdf_path)
+        doc_id = ingest_result["doc_id"]
     print(f"doc_id={doc_id} title={ingest_result['title']!r} pages={ingest_result['num_pages']}")
     print(f"sections detected: {ingest_result['sections']}")
 

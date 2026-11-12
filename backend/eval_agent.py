@@ -16,7 +16,7 @@ import json
 import logging
 
 from backend import llm_client
-from backend.ingestion_agent import IngestedPaper
+from backend.ingestion_agent import IngestedPaper, prioritized_excerpt
 from backend.rag_agent import RAGIndex
 
 logger = logging.getLogger("paperpilot.eval")
@@ -33,7 +33,7 @@ def judge_faithfulness(source_text: str, generated_text: str, label: str = "outp
     """Score how well `generated_text` is supported by `source_text`, 1-5.
     5 = fully supported, no invented claims. 1 = largely unsupported/hallucinated."""
     prompt = f"""SOURCE TEXT:
-{source_text[:5000]}
+{source_text[:12000]}
 
 GENERATED {label.upper()}:
 {generated_text}
@@ -41,7 +41,7 @@ GENERATED {label.upper()}:
 Score how faithfully the generated {label} reflects only what's in the source text.
 Respond with ONLY a JSON object of this exact shape, no other text:
 {{"score": <integer 1-5>, "reasoning": "<one sentence explaining the score>", "unsupported_claims": ["<claim not found in source>", ...]}}"""
-    raw = llm_client.complete_json(JUDGE_SYSTEM_PROMPT, prompt, max_tokens=300)
+    raw = llm_client.complete_json(JUDGE_SYSTEM_PROMPT, prompt, max_tokens=1500)
     try:
         parsed = json.loads(raw)
         return {
@@ -60,7 +60,7 @@ def evaluate_summary(paper: IngestedPaper, summary: dict) -> dict:
     against its own section text."""
     results = {"tldr": None, "section_summaries": []}
 
-    reference = f"{paper.abstract}\n\n{paper.full_text[:8000]}"
+    reference = prioritized_excerpt(paper, limit=12000)
     results["tldr"] = judge_faithfulness(reference, summary.get("tldr", ""), label="tldr")
 
     section_lookup = {s.heading: s.text for s in paper.sections}
@@ -75,14 +75,50 @@ def evaluate_summary(paper: IngestedPaper, summary: dict) -> dict:
     return results
 
 
+GAP_JUDGE_SYSTEM_PROMPT = (
+    "You are a strict peer reviewer. Given a paper excerpt and a proposed research gap, judge "
+    "whether the gap is valid: the paper must NOT already address it, and it must be a specific, "
+    "plausible limitation of this work. Score 1-5: 5 = valid and unaddressed by the paper; "
+    "1 = contradicted by the paper, generic, or irrelevant. A gap is NOT penalized for being "
+    "absent from the paper's text -- gaps are critiques of what is missing."
+)
+
+
+def judge_gap(source_text: str, gap_text: str) -> dict:
+    """Score whether an inferred gap is valid (not contradicted by the paper, specific,
+    plausible). Faithfulness-style 'is it supported by the text' is the wrong rubric for
+    gaps, since a gap describes something the paper does NOT contain."""
+    prompt = f"""PAPER EXCERPT:
+{source_text[:12000]}
+
+PROPOSED GAP:
+{gap_text}
+
+Respond with ONLY a JSON object of this exact shape, no other text:
+{{"score": <integer 1-5>, "reasoning": "<one sentence explaining the score>"}}"""
+    raw = llm_client.complete_json(GAP_JUDGE_SYSTEM_PROMPT, prompt, max_tokens=1500)
+    try:
+        parsed = json.loads(raw)
+        return {
+            "label": "inferred gap",
+            "score": int(parsed.get("score", 0)),
+            "reasoning": str(parsed.get("reasoning", "")),
+            "unsupported_claims": [],
+        }
+    except (json.JSONDecodeError, ValueError, TypeError):
+        logger.warning("judge_gap_parse_failed raw=%r", raw[:200])
+        return {"label": "inferred gap", "score": None, "reasoning": "Judge response could not be parsed.", "unsupported_claims": []}
+
+
 def evaluate_gaps(paper: IngestedPaper, gaps: dict) -> dict:
-    """Judge inferred gaps against the full paper text -- a gap should be something
-    the paper's text plausibly supports as *missing*, not an invented critique."""
-    reference = paper.full_text[:8000]
+    """Judge inferred gaps for validity (not contradicted by the paper, specific,
+    plausible) -- NOT for textual support, since a gap is by definition something
+    the paper doesn't say."""
+    reference = prioritized_excerpt(paper, limit=12000)
     results = []
     for item in gaps.get("inferred", []):
         gap_text = f"Gap: {item.get('gap', '')} Direction: {item.get('direction', '')}"
-        results.append(judge_faithfulness(reference, gap_text, label="inferred gap"))
+        results.append(judge_gap(reference, gap_text))
     return {"inferred_gaps": results}
 
 
@@ -115,10 +151,18 @@ def retrieval_hit_rate(rag_index: RAGIndex, test_cases: list[dict], k: int = 5) 
 
 def evaluate_chat_answers(rag_index: RAGIndex, qa_results: list[dict]) -> list[dict]:
     """qa_results: [{"question": str, "answer": str, "sources": [...]}]
-    Judges whether each chat answer is faithful to the chunks it cited."""
+    Judges whether each chat answer is faithful to the chunks it was given.
+
+    Uses each source's FULL chunk text (looked up by chunk_id), tagged with its
+    heading/page exactly as the answering model saw it -- not the 200-char `preview`,
+    which cut most of each chunk off and made the judge flag supported claims and
+    [section, page] citations as unsupported."""
     evaluations = []
     for qa in qa_results:
-        source_text = "\n\n".join(s.get("preview", "") for s in qa.get("sources", []))
+        source_text = "\n\n".join(
+            f"[{s['heading']}, p.{s['page_start']}]\n{rag_index.chunks[s['chunk_id']]['text']}"
+            for s in qa.get("sources", [])
+        )
         evaluations.append({
             "question": qa["question"],
             **judge_faithfulness(source_text, qa["answer"], label="chat answer"),
