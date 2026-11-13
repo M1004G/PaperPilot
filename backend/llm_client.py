@@ -58,7 +58,11 @@ def _call_with_retry(**create_kwargs) -> str:
                 getattr(usage, "completion_tokens", "?"),
                 getattr(usage, "total_tokens", "?"),
             )
-            return resp.choices[0].message.content or ""
+            content = resp.choices[0].message.content or ""
+            if not content.strip():
+                # Typically a reasoning model spending its whole max_tokens budget before answering.
+                raise LLMProviderError("The model returned an empty response (it may have run out of max_tokens).")
+            return content
         except groq.RateLimitError as e:
             last_error = e
             retry_after = None

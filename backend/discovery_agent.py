@@ -16,6 +16,7 @@ orchestrator.ingest_paper() that manual uploads already use.
 """
 import json
 import logging
+import os
 import tempfile
 import time
 
@@ -149,20 +150,17 @@ def download_pdf(url: str) -> str | None:
         return None
 
     max_bytes = config.DISCOVERY_PDF_MAX_SIZE_MB * 1024 * 1024
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     written = 0
-    try:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         for chunk in resp.iter_content(chunk_size=65536):
             written += len(chunk)
             if written > max_bytes:
                 logger.warning("discovery_pdf_too_large url=%s max_mb=%d", url, config.DISCOVERY_PDF_MAX_SIZE_MB)
-                tmp.close()
-                return None
+                break
             tmp.write(chunk)
-    finally:
-        tmp.close()
 
-    if written == 0:
+    if written == 0 or written > max_bytes:
+        os.unlink(tmp.name)  # don't leave empty/oversized downloads behind
         return None
     return tmp.name
 

@@ -10,10 +10,7 @@ from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel
 
 from backend import config
-from backend.orchestrator import orchestrator
-from backend.ingestion_agent import IngestionError
-from backend.llm_client import LLMProviderError
-from backend.logging_utils import new_request_id, set_request_id, get_request_id, RequestIdLogFilter
+from backend.logging_utils import new_request_id, set_request_id, RequestIdLogFilter
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
@@ -25,6 +22,11 @@ logging.basicConfig(
 for _handler in logging.getLogger().handlers:
     _handler.addFilter(RequestIdLogFilter())
 logger = logging.getLogger("paperpilot.api")
+
+# Imported only after logging is configured: creating the orchestrator logs on startup.
+from backend.orchestrator import orchestrator, UnknownDocumentError
+from backend.ingestion_agent import IngestionError
+from backend.llm_client import LLMProviderError
 
 app = FastAPI(title="PaperPilot API")
 
@@ -59,7 +61,7 @@ class ChatRequest(BaseModel):
 def _handle_known_errors(e: Exception):
     """Map internal exception types to the right HTTP status, and log the real
     error server-side rather than just echoing raw exception strings to the client."""
-    if isinstance(e, KeyError):
+    if isinstance(e, UnknownDocumentError):
         raise HTTPException(404, "Unknown doc_id") from e
     if isinstance(e, IngestionError):
         raise HTTPException(400, str(e)) from e
@@ -71,11 +73,11 @@ def _handle_known_errors(e: Exception):
 
 
 @app.post("/upload")
-async def upload(file: UploadFile = File(...)):
+def upload(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are supported.")
 
-    content = await file.read()
+    content = file.file.read()
     size_mb = len(content) / (1024 * 1024)
     if size_mb > config.MAX_PDF_SIZE_MB:
         raise HTTPException(

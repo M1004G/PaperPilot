@@ -116,7 +116,7 @@ python -m scripts.run_eval path/to/paper.pdf --questions questions.json --report
 ]
 ```
 
-Scoring uses retrieval hit-rate and an LLM-as-judge faithfulness check.
+Scoring uses retrieval hit-rate, an LLM-as-judge faithfulness check (summaries and chat answers), and a gap-validity check (inferred gaps).
 
 ## Error Handling
 

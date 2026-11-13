@@ -45,7 +45,7 @@ Every session write (ingestion, computed summary/gaps, chat turn) is persisted t
 
 ### 2. Summary Agent (`backend/summary_agent.py`)
 
-Produces a concise overview, per-section summaries, and key findings via three independent LLM calls.
+Produces a concise overview, key findings, and per-section summaries: one LLM call each for the overview and the findings, plus one call per section (run concurrently, capped by `LLM_MAX_CONCURRENT_CALLS`). If any call fails the error propagates and nothing is cached, so the next request retries.
 
 ### 3. Gap Analysis Agent (`backend/gap_agent.py`)
 
@@ -72,8 +72,8 @@ Assembles a single Markdown report from Summary and Gap outputs. No additional L
 ```
 # <Title>
 ## Concise Overview
-## Section Summaries
 ## Key Findings
+## Section Summaries
 ## Research Gaps
   ### Author-Acknowledged
   ### Inferred
@@ -97,6 +97,7 @@ Results are computed lazily on first request and cached; every cache update is p
 | `GET` | `/summary/{doc_id}` | Summary |
 | `GET` | `/gaps/{doc_id}` | Gap analysis |
 | `GET` | `/report/{doc_id}` | Markdown report |
+| `GET` | `/report/{doc_id}/download` | Download the report as a file |
 | `POST` | `/chat` | Grounded Q&A |
 
 Errors are mapped to distinct HTTP status codes: `IngestionError` → 400, unknown `doc_id` → 404, LLM provider failure → 502, unexpected errors → 500. All requests are logged with method, path, status, and timing.
@@ -112,8 +113,13 @@ SQLite-backed session store (`data/sessions.db`). Persists the ingested paper, c
 ### 10. Eval Agent (`backend/eval_agent.py`, `scripts/run_eval.py`)
 
 - **Retrieval hit-rate** — checks whether retrieved chunks contain expected keywords for a set of test questions.
-- **Faithfulness scoring** — LLM-as-judge scoring (1-5) of whether generated summaries/gaps/answers are supported by their source text.
+- **Faithfulness scoring** — LLM-as-judge scoring (1-5) of whether generated summaries and chat answers are supported by their source text.
+- **Gap validity scoring** — inferred gaps are judged on a different rubric (specific, plausible, not already addressed by the paper), since a gap describes something the paper does not say.
 - `scripts/run_eval.py` provides a CLI for running the full pipeline against a PDF.
+
+### 11. Discovery Agent (`backend/discovery_agent.py`)
+
+Standalone, not wired into the API. Given a topic, it searches Semantic Scholar, asks the LLM to pick the most relevant candidates, and downloads their open-access PDFs to temp files for the ingestion pipeline. Candidates with no free PDF are reported as found but not ingestable.
 
 ## Configuration Reference
 

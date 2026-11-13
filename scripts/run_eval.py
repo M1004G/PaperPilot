@@ -21,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from backend.orchestrator import Orchestrator
+from backend.orchestrator import orchestrator as orch
 from backend import eval_agent
 
 
@@ -45,8 +45,6 @@ def main():
     if args.questions:
         with open(args.questions) as f:
             test_cases = json.load(f)
-
-    orch = Orchestrator()
 
     _print_header("INGESTING")
     if args.doc_id:
@@ -98,7 +96,7 @@ def main():
         _print_header("RETRIEVAL HIT-RATE")
         retrieval_report = eval_agent.retrieval_hit_rate(session.rag_index, test_cases)
         for q in retrieval_report["per_question"]:
-            status = "HIT" if q["hit"] else "MISS"
+            status = {True: "HIT", False: "MISS", None: "N/A"}[q["hit"]]
             print(f"  [{status}] {q['question']} — matched: {q['matched_keywords']} — top: {q['top_sources']}")
         hr = retrieval_report["hit_rate"]
         print(f"\nOverall hit rate: {hr:.0%}" if hr is not None else "\nOverall hit rate: n/a")

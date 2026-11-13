@@ -1,12 +1,9 @@
 """Summary Agent: TL;DR, per-section summaries, and key findings."""
-import logging
 from concurrent.futures import ThreadPoolExecutor
 
 from backend import llm_client, config
 from backend.ingestion_agent import IngestedPaper, prioritized_excerpt
 from backend.logging_utils import copy_context_call
-
-logger = logging.getLogger("paperpilot.summary")
 
 SYSTEM_PROMPT = (
     "You are a meticulous research-paper summarization assistant. "
@@ -57,25 +54,11 @@ def section_summaries(paper: IngestedPaper) -> list[dict]:
 
     # Sections are independent, so summarize them concurrently -- but capped, since
     # Groq's free tier enforces a per-minute request limit (not just a token budget).
-    # Each future's failure is isolated: one section erroring (timeout, malformed
-    # content, transient provider issue) shouldn't discard every other section's
-    # already-successful summary.
-    results: list[dict] = [None] * len(sections)
+    # If any section fails the error propagates, so nothing partial gets cached and
+    # the next request simply retries.
     with ThreadPoolExecutor(max_workers=config.LLM_MAX_CONCURRENT_CALLS) as executor:
-        futures = {
-            executor.submit(copy_context_call, _summarize_one_section, s): i
-            for i, s in enumerate(sections)
-        }
-        for future, idx in futures.items():
-            try:
-                results[idx] = future.result()
-            except Exception as e:
-                logger.error("section_summary_failed heading=%r error=%s", sections[idx].heading, e)
-                results[idx] = {
-                    "heading": sections[idx].heading,
-                    "summary": "(Summary unavailable for this section due to an error.)",
-                }
-    return results
+        futures = [executor.submit(copy_context_call, _summarize_one_section, s) for s in sections]
+        return [f.result() for f in futures]
 
 
 def key_findings(paper: IngestedPaper) -> list[str]:

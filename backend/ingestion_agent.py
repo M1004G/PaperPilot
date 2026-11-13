@@ -17,8 +17,6 @@ from dataclasses import dataclass, field
 
 import fitz  # PyMuPDF
 
-from backend import config
-
 # Common top-level headings in research papers, used to split the document into sections.
 KNOWN_HEADINGS = [
     "abstract", "introduction", "related work", "background", "methodology",
@@ -310,7 +308,11 @@ def prioritized_excerpt(paper: IngestedPaper, limit: int) -> str:
         return "\n\n".join(parts)
 
     priority_sections = [s for s in paper.sections if s.heading.lower() in PRIORITY_HEADINGS]
-    other_sections = [s for s in paper.sections if s.heading.lower() not in PRIORITY_HEADINGS]
+    # The abstract was already added first, so don't repeat it as a section.
+    other_sections = [
+        s for s in paper.sections
+        if s.heading.lower() not in PRIORITY_HEADINGS and s.heading.lower() != "abstract"
+    ]
 
     for section in priority_sections:
         if not _add(f"[{section.heading}]\n{section.text}"):

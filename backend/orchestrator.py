@@ -12,6 +12,10 @@ from backend.rag_agent import RAGIndex
 logger = logging.getLogger("paperpilot.orchestrator")
 
 
+class UnknownDocumentError(Exception):
+    """Raised when a doc_id has no session. The API layer maps this to a 404."""
+
+
 @dataclass
 class DocSession:
     doc_id: str
@@ -90,7 +94,7 @@ class Orchestrator:
     def _get_session(self, doc_id: str) -> DocSession:
         with self._lock:
             if doc_id not in self.sessions:
-                raise KeyError(f"Unknown doc_id: {doc_id}")
+                raise UnknownDocumentError(f"Unknown doc_id: {doc_id}")
             return self.sessions[doc_id]
 
     # ---------- summary ----------
