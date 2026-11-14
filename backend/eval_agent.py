@@ -14,6 +14,7 @@ across real papers. Two kinds of checks:
 """
 import json
 import logging
+import time
 
 from backend import llm_client
 from backend.ingestion_agent import IngestedPaper, prioritized_excerpt
@@ -125,27 +126,30 @@ def evaluate_gaps(paper: IngestedPaper, gaps: dict) -> dict:
 def retrieval_hit_rate(rag_index: RAGIndex, test_cases: list[dict], k: int = 5) -> dict:
     """test_cases: [{"question": str, "expected_keywords": [str, ...]}, ...]
     A question 'hits' if at least one expected keyword appears (case-insensitive
-    substring match) in the retrieved chunks' text."""
+    substring match) in the retrieved chunks' text. Also records the rank of the first
+    retrieved chunk containing a keyword (for hit@k and MRR) and the retrieval latency."""
     per_question = []
-    hits = 0
     for case in test_cases:
         question = case["question"]
         expected = [kw.lower() for kw in case.get("expected_keywords", [])]
+        start = time.monotonic()
         retrieved = rag_index.retrieve(question, k=k)
-        combined_text = " ".join(r["text"].lower() for r in retrieved)
+        latency = time.monotonic() - start
+        chunk_texts = [r["text"].lower() for r in retrieved]
+        combined_text = " ".join(chunk_texts)
         matched = [kw for kw in expected if kw in combined_text]
-        hit = len(matched) > 0 if expected else None
-        if hit:
-            hits += 1
+        rank = next((i for i, text in enumerate(chunk_texts, 1) if any(kw in text for kw in expected)), None)
         per_question.append({
             "question": question,
             "expected_keywords": expected,
             "matched_keywords": matched,
-            "hit": hit,
+            "hit": (rank is not None) if expected else None,
+            "rank": rank,
+            "latency_s": latency,
             "top_sources": [f"{r['heading']} p.{r['page_start']}" for r in retrieved[:3]],
         })
     scored = [q for q in per_question if q["hit"] is not None]
-    hit_rate = hits / len(scored) if scored else None
+    hit_rate = sum(q["hit"] for q in scored) / len(scored) if scored else None
     return {"per_question": per_question, "hit_rate": hit_rate}
 
 
