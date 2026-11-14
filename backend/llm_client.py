@@ -44,6 +44,11 @@ def _call_with_retry(**create_kwargs) -> str:
     last_error = None
     call_start = time.monotonic()
 
+    if "gpt-oss" in create_kwargs.get("model", ""):
+        # gpt-oss models "think" before answering, and that thinking counts against max_tokens.
+        # With our small limits it can use the whole budget and leave an empty answer, so keep it short.
+        create_kwargs["extra_body"] = {"reasoning_effort": "low"}
+
     for attempt in range(config.LLM_MAX_RETRIES):
         try:
             attempt_start = time.monotonic()

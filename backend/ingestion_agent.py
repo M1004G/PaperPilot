@@ -43,8 +43,18 @@ TITLE_SKIP_PREFIXES = (
 NUMBERED_HEADING_RE = re.compile(r"^\s*(\d{1,2}(?:\.\d{1,2})*\.?|[IVX]{1,4}\.)\s+(?=[A-Z])")
 
 # Lines that *look* like headings by font (short, larger/bolder than body text)
-# but are almost never actual section headings -- figure/table/equation captions.
-_NON_HEADING_PREFIXES = ("figure", "fig.", "table", "eq.", "equation", "algorithm")
+# but are almost never actual section headings -- figure/table/equation captions,
+# theorem/proof statements and algorithm pseudocode.
+_NON_HEADING_PREFIXES = (
+    "figure", "fig.", "table", "eq.", "equation", "algorithm",
+    "lemma", "theorem", "proof", "corollary", "proposition", "definition",
+    "require:", "ensure:", "input:", "output:", "return ", "while ",
+    "end while", "end for", "end if",
+)
+# Greek letters, arrows and math operators: the line is a formula or pseudocode, not a heading.
+_MATH_CHARS_RE = re.compile(r"[Ͱ-Ͽ←-⋿]")
+# A year in the line means it is a reference-list entry ("Icassp 2013, 2013."), not a heading.
+_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 
 # A layout-detected heading must be noticeably larger than the body text...
 _HEADING_SIZE_RATIO = 1.15
@@ -161,6 +171,12 @@ def _is_layout_heading(line: dict, body_size: float, require_numbered: bool = Fa
         return False
     if text.endswith((".", ",", ";")) and len(words) > 6:
         return False  # reads like a full sentence, not a heading
+    if sum(c.isalpha() for c in text) < 4:
+        return False  # "X", "Pt", "2": fragments of a formula, not a heading
+    if _MATH_CHARS_RE.search(text) or _YEAR_RE.search(text):
+        return False  # formulas, pseudocode and reference entries
+    if text.lower().startswith(TITLE_SKIP_PREFIXES):
+        return False  # arXiv stamps, page headers and similar boilerplate
 
     size_ratio = (line["size"] / body_size) if body_size else 1.0
     strong_font = size_ratio >= _HEADING_SIZE_RATIO or (line["bold"] and size_ratio >= _HEADING_BOLD_MIN_RATIO)
@@ -184,7 +200,7 @@ def _clean_heading_text(text: str) -> str:
     how the source PDF styled them."""
     text = NUMBERED_HEADING_RE.sub("", text).strip().rstrip(":").strip()
     if text.isupper():
-        text = text.title()
+        text = " ".join(w.capitalize() for w in text.split())  # not .title(): it gives "Adam'S"
     return text
 
 

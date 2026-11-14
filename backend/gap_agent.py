@@ -14,6 +14,20 @@ SYSTEM_PROMPT = (
 LIMITATION_HEADINGS = {"limitations", "future work", "discussion", "conclusion", "conclusions"}
 
 
+def _parse_json(raw: str) -> dict:
+    """Parse the model's JSON reply. An unusable reply is an error (so nothing is cached and a
+    retry works), never an empty result that looks like a genuine "no gaps found"."""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise llm_client.LLMProviderError(
+            f"The model returned invalid JSON (the reply may have been cut off): {e}"
+        ) from e
+    if not isinstance(data, dict):
+        raise llm_client.LLMProviderError("The model returned JSON in an unexpected shape.")
+    return data
+
+
 def _limitation_text(paper: IngestedPaper) -> str:
     chunks = [s.text for s in paper.sections if s.heading.lower() in LIMITATION_HEADINGS]
     return "\n\n".join(chunks)[:5000]
@@ -33,11 +47,8 @@ Respond with ONLY a JSON object of this exact shape, no other text:
 {{"gaps": ["<one specific sentence per limitation>", ...]}}
 If nothing explicit is acknowledged, respond with {{"gaps": []}}."""
     raw = llm_client.complete_json(SYSTEM_PROMPT, prompt, max_tokens=400)
-    try:
-        parsed = json.loads(raw)
-        return [g.strip() for g in parsed.get("gaps", []) if isinstance(g, str) and g.strip()]
-    except (json.JSONDecodeError, AttributeError):
-        return []
+    parsed = _parse_json(raw)
+    return [g.strip() for g in parsed.get("gaps", []) if isinstance(g, str) and g.strip()]
 
 
 def inferred_gaps(paper: IngestedPaper, acknowledged: list[str]) -> list[dict]:
@@ -60,12 +71,8 @@ Respond with ONLY a JSON object of this exact shape, no other text, at most 6 it
 {{"gaps": [
   {{"gap": "<one-sentence description>", "confidence": "low|medium|high", "direction": "<one-sentence suggested future research direction>"}}
 ]}}"""
-    raw = llm_client.complete_json(SYSTEM_PROMPT, prompt, max_tokens=700)
-
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
+    raw = llm_client.complete_json(SYSTEM_PROMPT, prompt, max_tokens=1000)
+    parsed = _parse_json(raw)
 
     results = []
     for item in parsed.get("gaps", []):
@@ -74,7 +81,9 @@ Respond with ONLY a JSON object of this exact shape, no other text, at most 6 it
         gap = str(item.get("gap", "")).strip()
         confidence = str(item.get("confidence", "")).strip().lower()
         direction = str(item.get("direction", "")).strip()
-        if gap and confidence in ("low", "medium", "high") and direction:
+        if confidence not in ("low", "medium", "high"):
+            confidence = "medium"  # keep the gap even if the model words the confidence oddly
+        if gap and direction:
             results.append({"gap": gap, "confidence": confidence, "direction": direction})
     return results
 
