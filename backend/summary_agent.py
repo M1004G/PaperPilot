@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from backend import llm_client, config
 from backend.ingestion_agent import IngestedPaper, prioritized_excerpt
-from backend.logging_utils import copy_context_call
+from backend.logging_utils import submit_with_context
 
 SYSTEM_PROMPT = (
     "You are a meticulous research-paper summarization assistant. "
@@ -57,7 +57,7 @@ def section_summaries(paper: IngestedPaper) -> list[dict]:
     # If any section fails the error propagates, so nothing partial gets cached and
     # the next request simply retries.
     with ThreadPoolExecutor(max_workers=config.LLM_MAX_CONCURRENT_CALLS) as executor:
-        futures = [executor.submit(copy_context_call, _summarize_one_section, s) for s in sections]
+        futures = [submit_with_context(executor, _summarize_one_section, s) for s in sections]
         return [f.result() for f in futures]
 
 

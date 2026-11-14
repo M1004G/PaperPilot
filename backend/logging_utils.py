@@ -7,7 +7,7 @@ this uses a contextvar set once per request in main.py's middleware, and a
 logging.Filter that injects it into every log record automatically.
 
 contextvars don't propagate into concurrent.futures.ThreadPoolExecutor workers
-by default, so `copy_context_call` is used when submitting work to a pool
+by default, so `submit_with_context` is used when submitting work to a pool
 (see summary_agent.py) to carry the current request_id into those threads too.
 """
 import contextvars
@@ -37,12 +37,12 @@ class RequestIdLogFilter(logging.Filter):
         return True
 
 
-def copy_context_call(fn, *args, **kwargs):
-    """Run fn(*args, **kwargs) inside a snapshot of the *current* contextvars context.
-    Pass this to ThreadPoolExecutor.submit instead of fn directly to carry the
-    current request_id (and any other contextvars) into the worker thread:
+def submit_with_context(executor, fn, *args, **kwargs):
+    """Submit fn(*args, **kwargs) to a thread pool so it runs inside a copy of the
+    *caller's* contextvars (including the current request_id).
 
-        executor.submit(copy_context_call, fn, arg1, arg2)
+    The copy has to be taken here, in the submitting thread. A copy taken inside the
+    worker would only see the worker's own empty context.
     """
     ctx = contextvars.copy_context()
-    return ctx.run(fn, *args, **kwargs)
+    return executor.submit(ctx.run, fn, *args, **kwargs)
